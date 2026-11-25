@@ -2696,3 +2696,80 @@ fn signed_scalar_add_sub_scc_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn vop3_unsigned_add_sub_clamp() {
+    let cases = [
+        [0, 0, 1, u32::MAX],
+        [0, 1, 1, 0],
+        [1, 0, 1, 0],
+        [7, 4, 9, 0],
+        [u32::MAX, 0, 1, u32::MAX],
+        [u32::MAX, 2, u32::MAX, 0],
+        [u32::MAX, u32::MAX, u32::MAX, 0],
+    ];
+    for (op, add, reverse, carry_out) in [
+        (0x125, true, false, false),  // v_add_nc_u32
+        (0x126, false, false, false), // v_sub_nc_u32
+        (0x127, false, true, false),  // v_subrev_nc_u32
+        (0x30f, true, false, true),   // v_add_co_u32
+        (0x310, false, false, true),  // v_sub_co_u32
+        (0x319, false, true, true),   // v_subrev_co_u32
+        (0x128, true, false, true),   // v_add_co_ci_u32
+        (0x129, false, false, true),  // v_sub_co_ci_u32
+        (0x12a, false, true, true),   // v_subrev_co_ci_u32
+        (0x36d, true, false, false),  // v_add3_u32
+    ] {
+        for clamp in [false, true] {
+            let add3 = op == 0x36d;
+            let carry_in = matches!(op, 0x128..=0x12a);
+            let src2 = if carry_in {
+                sgpr(20)
+            } else if add3 {
+                vgpr(3)
+            } else {
+                0
+            };
+            let mut body = Vec::new();
+            if carry_in {
+                // v_add_co_u32 v5, s20, v4, 1
+                let mut seed = vop3(0x30f, 5, vgpr(4), 129, 0);
+                seed[0] |= 20 << 8;
+                body.extend(seed);
+            }
+            let mut inst = vop3(op, 0, vgpr(1), vgpr(2), src2);
+            inst[0] |= u32::from(clamp) << 15;
+            body.extend(inst);
+            let exact = |[a, b, d, seed]: [u32; 4]| {
+                let (a, b) = if reverse { (b, a) } else { (a, b) };
+                let carry = i64::from(carry_in && seed == u32::MAX);
+                if add {
+                    i64::from(a) + i64::from(b) + carry + if add3 { i64::from(d) } else { 0 }
+                } else {
+                    i64::from(a) - i64::from(b) - carry
+                }
+            };
+            let saturate = |result: i64| result.clamp(0, i64::from(u32::MAX));
+            run_cases(&build_valu_cs(&body), &cases, |backend, _, inputs, got| {
+                let result = exact(inputs);
+                let expected = if clamp { saturate(result) } else { result } as u32;
+                assert_eq!(
+                    got, expected,
+                    "{backend}: op {op:#x}, clamp {clamp}, {inputs:?}"
+                );
+            });
+            if carry_out {
+                // Read the carry/borrow mask in s0 independently of the result.
+                body.extend(vop3(0x101, 0, 128, 129, sgpr(0))); // v_cndmask_b32
+                run_cases(&build_valu_cs(&body), &cases, |backend, _, inputs, got| {
+                    let result = exact(inputs);
+                    let expected = u32::from(saturate(result) != result);
+                    assert_eq!(
+                        got, expected,
+                        "{backend}: op {op:#x}, clamp {clamp}, carry for {inputs:?}"
+                    );
+                });
+            }
+        }
+    }
+}
