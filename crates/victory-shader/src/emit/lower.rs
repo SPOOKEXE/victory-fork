@@ -4291,8 +4291,6 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Starts code only the lanes where `guard` holds run (a store under a
-    /// lane guard): returns where it started and the join block.
     /// Writes `field` over the bits of LDS dword `p` that `keep` clears, in
     /// the lanes `guard` holds for (`ds_write_b8` / `_b16` and their `_d16_hi`
     /// forms: LDS is dwords here). One compare-exchange, retried while another
@@ -4329,6 +4327,8 @@ impl<'a> Lower<'a> {
         self.end_guarded(at, &[]);
     }
 
+    /// Starts code only the lanes where `guard` holds run (a store under a
+    /// lane guard): returns where it started and the join block.
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
