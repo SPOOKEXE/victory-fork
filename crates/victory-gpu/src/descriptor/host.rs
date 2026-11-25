@@ -1844,9 +1844,18 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            // Constant buffer views marked: programs read no other
+            // non-buffer slot as one (`SLOT_STRIDE_CONSTANT`).
+            let entry = match (stride, view) {
+                (Some(s), _) => s,
+                (None, Some(View::Constant(..))) if victory_shader::emit::constant_marks() => {
+                    victory_shader::emit::SLOT_STRIDE_CONSTANT
+                }
+                _ => 0,
+            };
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -4261,6 +4270,36 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// The table of strides marks a constant buffer view's slot, and a
+    /// texture written over it after leaves no mark: a program that picks
+    /// the slot then reads zeros, not the texture's descriptor as a
+    /// constant buffer's.
+    #[test]
+    fn constant_buffer_slots_are_marked_in_the_stride_table() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !victory_shader::emit::constant_marks() {
+            return; // turned off for this run
+        }
+        let entry = |index: u32| -> u32 {
+            let (_, _, data) = heap.strides.as_ref().expect("a view heap has a table of strides");
+            // SAFETY: inside the mapping.
+            unsafe { (*data as *const u32).add(index as usize).read_volatile() }
+        };
+        let _ = heap.note_buffer(3, Some(&View::Constant(0x1000, 256)), false);
+        assert_eq!(entry(3), victory_shader::emit::SLOT_STRIDE_CONSTANT);
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let at = 0x7fec_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let texture = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        let _ = heap.note_buffer(3, Some(&texture), false);
+        assert_eq!(entry(3), 0);
+        let _ = heap.note_buffer(4, None, false);
+        assert_eq!(entry(4), 0);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's
