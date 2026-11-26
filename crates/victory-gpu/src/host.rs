@@ -6383,6 +6383,7 @@ impl Host {
                 lists.push(list.list.cast().ok());
             }
             part = prep_part(1, part);
+            batch.flush_fills();
             batch.flush();
         }
         crate::watch::ask_once_end();
@@ -8308,6 +8309,10 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
+                    if wide_fills() {
+                        batch.fills.push((dst, src, len));
+                        continue;
+                    }
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     copy_fill(dst as *mut u8, src as *const u8, len);
@@ -8323,6 +8328,8 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    // (host work may read upload memory the fills put off write)
+                    batch.flush_fills();
                     let _span = crate::trace::span(if matches!(step, Step::Run(_)) { "step: our code on title memory" } else { "step: host work" });
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
@@ -8486,6 +8493,73 @@ struct Batch {
     /// Staging buffers due, refreshed together at the next flush, several
     /// at a time (each reads its own title memory into its own buffer).
     staged: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// Fills of upload memory (to, from, bytes) put off ([`wide_fills`]):
+    /// copied on the wide threads together, before the next step that
+    /// writes title memory and before the lists go to the card.
+    fills: Vec<(usize, usize, usize)>,
+}
+
+/// Whether a submission's fills of upload memory are put off and copied
+/// on the wide threads together (`VICTORY_WIDE_FILLS`, on unless `0`). Each
+/// is a copy of title memory into upload memory of the list's own, some
+/// 10,000 a frame on the submitting thread one after another (the time
+/// line, F7: the submitting thread busy the whole frame and the card idle
+/// between its submissions, the wide threads idle). A fill only reads title
+/// memory, so they wait for nothing but a step that writes it.
+fn wide_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_FILLS").is_none_or(|v| v != "0"))
+}
+
+impl Batch {
+    /// Copies the fills put off ([`wide_fills`]), many together on the wide
+    /// threads, a few here.
+    fn flush_fills(&mut self) {
+        if self.fills.is_empty() {
+            return;
+        }
+        let fills = std::mem::take(&mut self.fills);
+        let bytes: usize = fills.iter().map(|f| f.2).sum();
+        let _span = crate::trace::span("fills together");
+        let started = crate::clock::now_us();
+        // A piece of work is about this many bytes, or this many fills.
+        const PIECE_BYTES: usize = 512 << 10;
+        const PIECE_FILLS: usize = 256;
+        if bytes < PIECE_BYTES && fills.len() < PIECE_FILLS {
+            for (to, from, len) in fills {
+                copy_fill(to as *mut u8, from as *const u8, len);
+            }
+        } else {
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+            let mut piece = Vec::new();
+            let mut piece_bytes = 0;
+            for fill in fills {
+                piece_bytes += fill.2;
+                piece.push(fill);
+                if piece_bytes >= PIECE_BYTES || piece.len() >= PIECE_FILLS {
+                    let done = std::mem::take(&mut piece);
+                    piece_bytes = 0;
+                    jobs.push(Box::new(move || {
+                        let _span = crate::trace::span("fills: a piece");
+                        for (to, from, len) in done {
+                            copy_fill(to as *mut u8, from as *const u8, len);
+                        }
+                    }));
+                }
+            }
+            if !piece.is_empty() {
+                jobs.push(Box::new(move || {
+                    let _span = crate::trace::span("fills: a piece");
+                    for (to, from, len) in piece {
+                        copy_fill(to as *mut u8, from as *const u8, len);
+                    }
+                }));
+            }
+            crate::shadow::wide_run(jobs);
+        }
+        preparing(0, crate::clock::now_us() - started);
+        preparing(1, bytes as u64);
+    }
 }
 
 impl Batch {
@@ -8608,6 +8682,7 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.flush_fills();
         self.flush();
         self.textures.clear();
         // Where it writes is not known: no copy counts as up to date.
@@ -8619,6 +8694,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
+        self.flush_fills();
         self.flush();
         self.textures.clear();
         let end = at + len;
