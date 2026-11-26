@@ -84,7 +84,9 @@ const SNAP_WAIT_NS: u64 = 2_000_000_000;
 /// written as Markdown to `snapshots/<time>.md` under the run's folder.
 struct Snap {
     started: u64,
+    /// The frame log's totals at the start; at the end, what they grew by.
     totals: Vec<u64>,
+    ended: bool,
     frames: Vec<f32>,
     spans: HashMap<(String, &'static str), (u64, u32)>,
     gpu: HashMap<String, (u64, u32)>,
@@ -337,6 +339,7 @@ pub(crate) fn frame() {
             s.snap = Some(Snap {
                 started: now,
                 totals: crate::framelog::totals(),
+                ended: false,
                 frames: Vec::new(),
                 spans: HashMap::new(),
                 gpu: HashMap::new(),
@@ -355,14 +358,13 @@ pub(crate) fn frame() {
     if let Some(snap) = s.snap.as_mut() {
         if now < snap.started + SNAP_NS {
             snap.frames.push(frame_ms);
-            if now + 30_000_000 >= snap.started + SNAP_NS {
-                snap.totals = crate::framelog::totals()
-                    .iter()
-                    .zip(&snap.totals)
-                    .map(|(now, was)| now.saturating_sub(*was))
-                    .collect();
-            }
-        } else if now >= snap.started + SNAP_NS + SNAP_WAIT_NS {
+        } else if !snap.ended {
+            // (the first present past the recording: the totals' growth over it)
+            snap.ended = true;
+            snap.totals =
+                crate::framelog::totals().iter().zip(&snap.totals).map(|(now, was)| now.saturating_sub(*was)).collect();
+        }
+        if now >= snap.started + SNAP_NS + SNAP_WAIT_NS {
             let snap = s.snap.take().expect("checked");
             RECORDING.store(false, Relaxed);
             let laid = lay_out(&s.timeline, &s.presents, now);
