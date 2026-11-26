@@ -7005,10 +7005,15 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            let stale = behind && {
+                let _span = crate::trace::span("ask once: refreshed ranges under flights?");
+                stale_under_flights(runs)
+            };
+            if stale {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
+                let _span = crate::trace::span("ask once: asked again after the settle");
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
