@@ -1162,6 +1162,9 @@ pub(crate) struct HostList {
     /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
     /// last, open until the next one is bound or the list closes.
     pipeline_meter: AtomicU32,
+    /// This recording's mark in the breadcrumbs ([`crumb_list`]), taken at
+    /// each reset (diagnostics).
+    crumb_id: AtomicU32,
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
     gather: Mutex<Gather>,
@@ -1303,7 +1306,16 @@ impl Drop for HostList {
 /// A list's mark in the breadcrumbs' high half: its address's bits.
 #[cfg(feature = "diagnostics")]
 fn crumb_list(list: &HostList) -> u32 {
-    ((std::ptr::from_ref(list) as usize >> 4) & 0xffff) as u32
+    list.crumb_id.load(Ordering::Relaxed)
+}
+
+/// A new recording's mark: numbered in turn, leaving out the marks of our
+/// own lists (0xfff0 and up): unique among the recordings of the last
+/// minutes, which a mark built from the list's address was not.
+#[cfg(feature = "diagnostics")]
+fn next_crumb_id() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed) % 0xfff0
 }
 
 /// A breadcrumb of a list of the layer's own (`mark` names it: 0xfff1 the
@@ -1374,11 +1386,13 @@ fn crumbs_report(what: &str) {
         tracing::error!("breadcrumbs: the list had begun and none of its noted commands had");
         return;
     }
-    let from = done.min(begun).saturating_sub(2) as usize;
-    let to = (begun as usize).saturating_add(2).min(notes.len().saturating_sub(1));
-    for k in from..=to {
+    // The card stopped at the first command not done (the begun marks run
+    // ahead: they are written as commands start, without waiting).
+    tracing::error!("breadcrumbs: {} commands noted in the list", notes.len());
+    let from = done.saturating_sub(2) as usize;
+    for k in from..(from + 8).min(notes.len()) {
         if let Some((text, range)) = notes.get(k) {
-            tracing::error!("breadcrumbs: command {k}: {text} (reads {range:x?})");
+            tracing::error!("breadcrumbs: command {k}{}: {text} (reads {range:x?})", if k == done as usize { " (the first not done)" } else { "" });
         }
     }
 }
@@ -4614,6 +4628,7 @@ impl Host {
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
+                crumb_id: AtomicU32::new(0),
                 gather: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -7115,6 +7130,16 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         if crumbs_on() {
+            let id = next_crumb_id();
+            let old = self.crumb_id.swap(id, Ordering::Relaxed);
+            {
+                let mut lists = CRUMB_LISTS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(map) = lists.as_mut()
+                    && map.get(&old) == Some(&(std::ptr::from_ref(self) as usize))
+                {
+                    map.remove(&old);
+                }
+            }
             crumb(&self.list, crumb_list(self) << 16 | 0xfffe);
             CRUMB_LISTS
                 .lock()
