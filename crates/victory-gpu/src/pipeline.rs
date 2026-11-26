@@ -134,6 +134,27 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
 }
 
+/// Programs that are not run, by the 16-digit hash: `VICTORY_HOLD_SHADERS=<hash>,...` (empty:
+/// none). By default the title's GPU heap defrag (`CS_DefragHeap_ComputeRelocations`,
+/// 02384a60fda6f2d0): once it runs the title moves resources about in its memory, and the
+/// textures made from that memory come out as coloured blocks (characters' clothes and faces
+/// in the boat scene) while thousands are made again. Without it the heap is not compacted,
+/// which a card with this much memory does not need.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn held(hash: &str) -> bool {
+    static HELD: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HELD.get_or_init(|| {
+        std::env::var("VICTORY_HOLD_SHADERS")
+            .unwrap_or_else(|_| "02384a60fda6f2d0".to_owned())
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .iter()
+    .any(|h| h == hash)
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
@@ -142,7 +163,11 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let wide = victory_shader::emit::wave_wide_listed(&self.hash);
-                let done = victory_shader::emit::with_wave_wide(wide, || translate(&self.container));
+                let done = if held(&self.hash) {
+                    Err("held back (VICTORY_HOLD_SHADERS)".to_owned())
+                } else {
+                    victory_shader::emit::with_wave_wide(wide, || translate(&self.container))
+                };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
