@@ -561,7 +561,11 @@ What did it, on top of the list below:
     copies don't wait for flights and are checked against what the
     flights then wrote (on by default until #1025: its one mismatch a run,
     as the café flashback begins, left a blurred oval over the picture
-    until the next scene, so fills wait by default again); up to 512 idle
+    until the next scene, so fills wait by default again;
+    `VICTORY_FILL_WAIT=learn`, run.sh's default, waits only in the 64 KiB
+    pieces shaders have changed this run and reads ahead elsewhere: in the
+    café one fill a frame waits instead of two, 41 ms of the submit thread
+    a frame down to 6 to 19, no fill seen to miss); up to 512 idle
     host lists and texture staging buffers are reused instead of made and
     freed every frame.
   - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside

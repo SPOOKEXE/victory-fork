@@ -3535,6 +3535,21 @@ fn line() -> std::sync::MutexGuard<'static, Line> {
     LINE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`relay_wait`]'s span by `why`.
+const RELAY_WAITS: [&str; 11] = [
+    "relay wait: flights land",
+    "relay wait: flights land",
+    "relay wait: a synchronous submission or present",
+    "relay wait: the card had run them",
+    "relay wait: a memory value",
+    "relay wait: title memory changed under shader writes",
+    "relay wait: title memory read",
+    "relay wait: a step of ours",
+    "relay wait: lists in the air",
+    "relay wait: bottom-of-pipe writes",
+    "relay wait: a blocking fence wait",
+];
+
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
 const WHY_SYNC: usize = 2;
 const WHY_CARD_DONE: usize = 3;
@@ -3627,7 +3642,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3645,7 +3660,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3705,8 +3720,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// oval then stayed over the middle of the picture until the next scene,
 /// in 6 of 7 runs; with fills waiting from the start, in 0 of 3
 /// (victory-fork#1025). So fills wait unless `VICTORY_FILL_WAIT=0`.
+///
+/// `VICTORY_FILL_WAIT=learn` waits by place instead: a fill waits only if
+/// the 64 KiB it reads are ones shaders have changed before in this run
+/// (every landing's changed bytes are noted, [`wrote`]), and reads ahead
+/// elsewhere. A fill that read bytes a flight then changed is still seen
+/// and counted, and its piece waits from then on; the rest go on reading
+/// ahead. (A cutscene's per-draw constants are written by the title at new
+/// addresses each frame; shaders' own results stay in their own places.)
 mod fill_ahead {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     use std::sync::{Mutex, OnceLock};
 
@@ -3747,15 +3770,55 @@ mod fill_ahead {
 
     static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
 
-    pub(super) fn on() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| reads_ahead(std::env::var_os("VICTORY_FILL_WAIT").as_deref())) && !WAIT.load(Relaxed)
+    /// How fills under flights are treated (`VICTORY_FILL_WAIT`).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Mode {
+        /// They wait (unset, or anything else).
+        Wait,
+        /// They read ahead until one is seen to have missed (`0`).
+        Ahead,
+        /// They wait where shaders have written, else read ahead (`learn`).
+        Learn,
     }
 
-    /// Whether fills may read ahead of flights, from `VICTORY_FILL_WAIT`:
-    /// only when it is `0`.
-    fn reads_ahead(value: Option<&std::ffi::OsStr>) -> bool {
-        value.is_some_and(|v| v == "0")
+    fn mode() -> Mode {
+        static MODE: OnceLock<Mode> = OnceLock::new();
+        *MODE.get_or_init(|| mode_of(std::env::var_os("VICTORY_FILL_WAIT").as_deref()))
+    }
+
+    fn mode_of(value: Option<&std::ffi::OsStr>) -> Mode {
+        match value.and_then(|v| v.to_str()) {
+            Some("0") => Mode::Ahead,
+            Some("learn") => Mode::Learn,
+            _ => Mode::Wait,
+        }
+    }
+
+    /// Whether fills may read ahead of flights at all now.
+    pub(super) fn on() -> bool {
+        match mode() {
+            Mode::Wait => false,
+            Mode::Ahead => !WAIT.load(Relaxed),
+            Mode::Learn => true,
+        }
+    }
+
+    /// The 64 KiB pieces shaders have changed in this run ([`Mode::Learn`]).
+    static WRITTEN: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+    /// Whether a read of title memory at `src` may go ahead of flights that
+    /// may write it: [`on`], and with [`Mode::Learn`] not in a piece
+    /// shaders have changed.
+    pub(super) fn ahead(src: usize, len: usize) -> bool {
+        if !on() {
+            return false;
+        }
+        if mode() != Mode::Learn || len == 0 {
+            return true;
+        }
+        let written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(set) = written.as_ref() else { return true };
+        !(src / PIECE..=(src + len - 1) / PIECE).any(|p| set.contains(&p))
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -3781,7 +3844,15 @@ mod fill_ahead {
     /// A landing is about to put `new` into title memory at `at`: bytes
     /// shaders wrote, merged into the title's.
     pub(crate) fn wrote(at: usize, new: &[u8]) {
-        if new.is_empty() || WAIT.load(Relaxed) {
+        if new.is_empty() {
+            return;
+        }
+        if mode() == Mode::Learn {
+            let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            let set = written.get_or_insert_with(HashSet::new);
+            set.extend(at / PIECE..=(at + new.len() - 1) / PIECE);
+        }
+        if WAIT.load(Relaxed) {
             return;
         }
         let frame = crate::frame::current();
@@ -3813,6 +3884,17 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if mode() == Mode::Learn {
+                // (its piece is noted above: fills there wait from now on)
+                tracing::warn!(
+                    "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
+                     them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
+                     Fills of that 64 KiB wait from here on ({n} such fills)",
+                    to - from,
+                    a + first
+                );
+                return;
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
@@ -3843,10 +3925,13 @@ mod fill_ahead {
                 map.values().map(|p| p.fills.len()).sum::<usize>()
             })
         };
+        let learned = WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashSet::len);
         tracing::info!(
-            "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT=0): {:.1} per \
+            "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT={}): {:.1} per \
              frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
-             bytes a flight then changed, since the start: {}{}; {kept} fills kept to check",
+             bytes a flight then changed, since the start: {}{}; {kept} fills kept to check; {learned} pieces of 64 KiB shaders \
+             changed, where fills wait",
+            if mode() == Mode::Learn { "learn" } else { "0" },
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
@@ -3856,15 +3941,16 @@ mod fill_ahead {
 
     #[cfg(test)]
     mod tests {
-        use super::reads_ahead;
+        use super::{Mode, mode_of};
         use std::ffi::OsStr;
 
         #[test]
-        fn fills_wait_unless_the_switch_is_zero() {
-            assert!(!reads_ahead(None), "unset: fills wait");
-            assert!(!reads_ahead(Some(OsStr::new("1"))), "1: fills wait");
-            assert!(!reads_ahead(Some(OsStr::new(""))), "empty: fills wait");
-            assert!(reads_ahead(Some(OsStr::new("0"))), "0: fills read ahead");
+        fn fills_wait_unless_the_switch_says_otherwise() {
+            assert_eq!(mode_of(None), Mode::Wait, "unset: fills wait");
+            assert_eq!(mode_of(Some(OsStr::new("1"))), Mode::Wait, "1: fills wait");
+            assert_eq!(mode_of(Some(OsStr::new(""))), Mode::Wait, "empty: fills wait");
+            assert_eq!(mode_of(Some(OsStr::new("0"))), Mode::Ahead, "0: fills read ahead");
+            assert_eq!(mode_of(Some(OsStr::new("learn"))), Mode::Learn, "learn: by place");
         }
     }
 }
@@ -4520,6 +4606,10 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    let mut _span = crate::trace::span(RELAY_WAITS.get(why).copied().unwrap_or("relay wait: flights land"));
+    if let Some(span) = &mut _span {
+        span.arg(why as u64);
+    }
     let was_working = working(false);
     let waiting = std::time::Instant::now();
     while !done(&line) {
@@ -6780,13 +6870,19 @@ impl Host {
         };
         let was_working = working(true);
         submitting(1, runs.len());
-        self.video_memory_look();
+        {
+            let _span = crate::trace::span("submit: the card's memory looked at");
+            self.video_memory_look();
+        }
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else if let Some(why) = {
+            let _span = crate::trace::span("submit: what flights write, against these lists");
+            late_blocked(runs)
+        } {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.

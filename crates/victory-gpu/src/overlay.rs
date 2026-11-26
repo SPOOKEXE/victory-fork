@@ -114,6 +114,8 @@ struct Laid {
 }
 
 /// Thread groups of the time line, in the order of its rows.
+/// ("title threads", the title's unnamed workers, are left out: a score of
+/// threads mostly waiting for work, one bar over another.)
 const GROUPS: [&str; 6] = ["title render thread", "title-main", "victory-submit", "victory-wide", "victory-relay", "card"];
 
 fn group_index(group: &str) -> u8 {
@@ -219,10 +221,29 @@ pub(crate) fn thread_group(tid: u32) -> Option<String> {
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&tid).cloned()
 }
 
+/// The calling thread presents frames: it is the title's render thread
+/// (taken out of "title threads"). Once per thread.
+pub(crate) fn render_thread() {
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if DONE.replace(true) {
+        return;
+    }
+    // SAFETY: a plain query.
+    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let threads = threads.get_or_insert_with(HashMap::new);
+    if threads.get(&tid).is_none_or(|g| g == "title threads") {
+        threads.insert(tid, "title render thread".to_owned());
+    }
+}
+
 /// A thread's name, once, as it first times a span.
 pub(crate) fn thread_name(tid: u32, name: &str) {
     let group = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-' || c == ' ');
-    let group = if group == "thread" { "title render thread" } else { group };
+    // (the title's own threads have no names: one group, until one presents)
+    let group = if group == "thread" { "title threads" } else { group };
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(tid, group.to_owned());
 }
 
@@ -416,11 +437,12 @@ pub(crate) fn frame() {
         let order = |g: &str| match g {
             "title render thread" => 0,
             "title-main" => 1,
-            "victory-submit" => 2,
-            "victory-wide" => 3,
-            "victory-relay" => 4,
-            "card" => 5,
-            _ => 6,
+            "title threads" => 2,
+            "victory-submit" => 3,
+            "victory-wide" => 4,
+            "victory-relay" => 5,
+            "card" => 6,
+            _ => 7,
         };
         s.rows.sort_by(|a, b| order(&a.0).cmp(&order(&b.0)).then(a.0.cmp(&b.0)).then(b.2.total_cmp(&a.2)));
         s.gpu_rows = s.gpu.drain().map(|(name, (us, count))| (name, us as f64 / 1e3 / n, f64::from(count) / n)).collect();
@@ -875,20 +897,22 @@ pub(crate) fn draw() -> Vec<u32> {
     let first = (SCROLL.load(Relaxed) as usize).min(lines.len().saturating_sub(room));
     SCROLL.store(first as u32, Relaxed);
     // (the card's view: wider names, the shaders' own)
-    let names = if view == 1 || view == 3 { 228 } else { 150 };
+    let names = if view == 1 || view == 3 || view == 4 { 228 } else { 150 };
     let (bar_x, bar_w) = (names, WIDTH - names - 104);
     let mut y = top;
     for (label, value) in lines.iter().skip(first).take(room) {
         match value {
             None => text_at(&mut px, 2, y, label, HEAD),
             Some((v, count, full)) => {
-                let chars = if view == 3 { 36 } else { 23 };
+                let chars = if view == 3 || view == 4 { 36 } else { 23 };
                 text_at(&mut px, 8, y, &label.chars().take(chars).collect::<String>(), TEXT);
                 let share = v / full.max(1.0);
                 let len = (share.min(1.0) * f64::from(bar_w)) as u32;
+                // (the system's per cents: red only near full, where it holds the frame)
+                let (red, amber) = if view == 4 { (0.85, 0.6) } else { (0.25, 0.08) };
                 let colour = match share {
-                    f if f >= 0.25 => 0xffe0_5050,
-                    f if f >= 0.08 => 0xffe0_b040,
+                    f if f >= red => 0xffe0_5050,
+                    f if f >= amber => 0xffe0_b040,
                     _ => 0xff50_c070,
                 };
                 for yy in y..y + 7 {

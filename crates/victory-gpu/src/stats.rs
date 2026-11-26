@@ -193,8 +193,12 @@ fn thread_label(id: u32) -> String {
         }
     }
     if name.is_empty() {
-        // (a title thread without a description: the group its spans go under)
-        name = crate::overlay::thread_group(id).unwrap_or_else(|| "thread".to_owned());
+        // (a thread without a description: the group its spans go under)
+        name = match crate::overlay::thread_group(id) {
+            Some(group) if group == "title threads" => "title thread".to_owned(),
+            Some(group) => group,
+            None => "thread".to_owned(),
+        };
     }
     format!("{name} ({id})")
 }

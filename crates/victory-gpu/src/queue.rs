@@ -1309,6 +1309,7 @@ extern "system" fn present(
 }
 
 fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
+    crate::overlay::render_thread();
     let _span = crate::trace::span("present");
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
