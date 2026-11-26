@@ -2221,6 +2221,7 @@ impl HostHeap {
         (start, step): (u64, u64),
         from: usize,
         page: &[u8],
+        later: Option<&mut Vec<(u32, u64)>>,
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
@@ -2264,12 +2265,52 @@ impl HostHeap {
             }
         }
         let making = std::time::Instant::now();
-        for &(index, handle) in &due {
-            self.mirror(index, handle, false);
-        }
         super::SYNC_PARTS[2].fetch_add((making - walking).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        let made = due.len() as u64;
+        match later {
+            // (made by the caller, with the other pages' records, on several threads)
+            Some(later) => later.extend(due),
+            None => {
+                for &(index, handle) in &due {
+                    self.mirror(index, handle, false);
+                }
+                super::SYNC_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        (looked, made)
+    }
+
+    /// Makes the host slots of `due` (slot, handle), records of the title's that
+    /// changed ([`HostHeap::mirror_copied_page`]), on the wide threads: each slot
+    /// once, each from its own record, as the title's own threads make slots
+    /// (`mirror` takes its locks slot by slot).
+    pub(crate) fn mirror_wide(&self, due: Vec<(u32, u64)>) {
+        let making = std::time::Instant::now();
+        const PIECE: usize = 256;
+        if due.len() <= PIECE {
+            for (index, handle) in due {
+                self.mirror(index, handle, false);
+            }
+        } else {
+            // (the heap outlives the call: `wide_run` returns when every piece is done)
+            let heap = self as *const HostHeap as usize;
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+                .chunks(PIECE)
+                .map(|piece| {
+                    let piece = piece.to_vec();
+                    Box::new(move || {
+                        let _span = crate::trace::span("heap sync: make slots");
+                        // SAFETY: see above.
+                        let heap = unsafe { &*(heap as *const HostHeap) };
+                        for (index, handle) in piece {
+                            heap.mirror(index, handle, false);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+        }
         super::SYNC_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-        (looked, due.len() as u64)
     }
 
     /// Makes host slot `index` from the record at `handle` if it is still

@@ -212,6 +212,9 @@ pub(crate) fn sync_heaps() {
         };
         let asking = std::time::Instant::now();
         let ranges = written.take(start as usize, looked_end);
+        // The changed records of every page, made together on the wide threads
+        // (`VICTORY_HEAP_SYNC_WIDE=0`: page by page here, as before).
+        let mut due: Vec<(u32, u64)> = Vec::new();
         SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
@@ -236,7 +239,8 @@ pub(crate) fn sync_heaps() {
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
                         let _span = crate::trace::span("heap sync: mirror records");
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        let later = sync_wide().then_some(&mut due);
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes, later);
                         looked += seen;
                         mirrored += made;
                         0..0
@@ -264,11 +268,25 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        if !due.is_empty() {
+            let _span = crate::trace::span("heap sync: make slots together");
+            host.mirror_wide(due);
+        }
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
+}
+
+/// Whether [`sync_heaps`] makes the host slots of a pass's changed records
+/// on the wide threads (`VICTORY_HEAP_SYNC_WIDE`, on unless `0`): some
+/// 9,000 a frame, 40 to 60 ms on the submitting thread while the card
+/// waited for it (the time line, F7).
+#[cfg(windows)]
+fn sync_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_WIDE").is_none_or(|v| v != "0"))
 }
 
 /// Whether [`sync_heaps`] leaves alone the part of a title view heap the
