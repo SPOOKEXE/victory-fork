@@ -6001,6 +6001,38 @@ impl Host {
             order.splice(0..0, first..first + ahead.len());
             lists.extend(ahead.into_iter().map(crate::list::Detached::ours));
         }
+        // A long submission goes to the card in parts ([`split_lists`]): the
+        // card starts on the first while the rest are prepared.
+        let part = split_lists();
+        if part > 0 && order.len() > part {
+            let mut seen = vec![false; lists.len()];
+            let unique = order.iter().all(|&i| !std::mem::replace(&mut seen[i], true));
+            if unique {
+                let mut slots: Vec<Option<crate::list::Detached>> = lists.into_iter().map(Some).collect();
+                let parts: Vec<Vec<usize>> = order.chunks(part).map(<[usize]>::to_vec).collect();
+                let last = parts.len() - 1;
+                for (k, indices) in parts.into_iter().enumerate() {
+                    let mut mine = Vec::with_capacity(indices.len());
+                    for i in indices {
+                        mine.push(slots[i].take().expect("each list once"));
+                    }
+                    let sub_order: Vec<usize> = (0..mine.len()).collect();
+                    // (lists the title named but did not order go with the last part,
+                    // which lets them go when it has run)
+                    if k == last {
+                        mine.extend(slots.iter_mut().filter_map(Option::take));
+                    }
+                    SPLIT_PARTS.fetch_add(1, Ordering::Relaxed);
+                    self.execute_late_part(mine, sub_order);
+                }
+                return;
+            }
+        }
+        self.execute_late_part(lists, order);
+    }
+
+    /// [`Host::execute_late`] of lists sent as one submission.
+    fn execute_late_part(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
@@ -8498,6 +8530,22 @@ struct Batch {
     /// writes title memory and before the lists go to the card.
     fills: Vec<(usize, usize, usize)>,
 }
+
+/// Lists a title submission sent ahead is cut into (`VICTORY_SPLIT_LISTS`,
+/// default 8; 0: not cut): each part is prepared and sent as a submission
+/// of its own, in order on the same queue, so the card starts on the first
+/// part while the next is prepared (the time line, F7: the card idle while
+/// a submission of many lists was prepared, 61 ms for one of them). The
+/// title's fence signals and value writes follow the last part, as they
+/// followed the whole. A part that reads what an earlier part's shaders
+/// write waits for it to land, as any submission sent ahead does.
+fn split_lists() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_SPLIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8))
+}
+
+/// Parts sent by [`split_lists`] since the start.
+static SPLIT_PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a submission's fills of upload memory are put off and copied
 /// on the wide threads together (`VICTORY_WIDE_FILLS`, on unless `0`). Each
