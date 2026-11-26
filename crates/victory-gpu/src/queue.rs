@@ -1247,6 +1247,35 @@ pub(crate) enum Written {
     /// (`crate::query::resolve`, `VICTORY_OCCLUSION`): read when written,
     /// which is once the list has run.
     Query(u32),
+    /// The card's own clock where the list stood when the title asked
+    /// ([`crate::query::stamp`], `VICTORY_CARD_TIMESTAMPS`), on the
+    /// [`GpuTimestamp`](Written::GpuTimestamp) timeline.
+    CardTimestamp(u32),
+}
+
+/// [`TIMESTAMP_FREQUENCY`] ticks since the first call, from the CPU's
+/// performance counter `qpc` (the timeline of [`Written::GpuTimestamp`]).
+pub(crate) fn gpu_clock_at(qpc: u64) -> u64 {
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(system_timestamp);
+    let freq = qpc_frequency();
+    (u128::from(qpc.saturating_sub(start)) * u128::from(TIMESTAMP_FREQUENCY) / u128::from(freq.max(1))) as u64
+}
+
+/// The CPU's performance counter's ticks per second.
+pub(crate) fn qpc_frequency() -> u64 {
+    static FREQ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FREQ.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            let mut f = 0;
+            // SAFETY: a valid out pointer.
+            unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
+            f.max(1) as u64
+        }
+        #[cfg(not(windows))]
+        1
+    })
 }
 
 impl Written {
@@ -1254,13 +1283,10 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
-            Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
-            }
+            Written::GpuTimestamp => gpu_clock_at(system_timestamp()),
             Written::SystemTimestamp => system_timestamp(),
             Written::Query(slot) => crate::query::result(slot),
+            Written::CardTimestamp(slot) => crate::query::stamp_value(slot),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
@@ -1273,7 +1299,7 @@ impl Written {
     }
 }
 
-fn system_timestamp() -> u64 {
+pub(crate) fn system_timestamp() -> u64 {
     #[cfg(windows)]
     {
         let mut count = 0;

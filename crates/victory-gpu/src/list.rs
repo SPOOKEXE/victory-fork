@@ -2124,7 +2124,8 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
-/// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
+/// GPU timestamp instead (64-bit form; the title writes about five a frame),
+/// flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
@@ -2133,6 +2134,12 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
+        // The card's own clock where the list stands, with the switch.
+        #[cfg(windows)]
+        GPU_TIMESTAMP => host_list(this)
+            .and_then(crate::query::stamp)
+            .map_or(Written::GpuTimestamp, Written::CardTimestamp),
+        #[cfg(not(windows))]
         GPU_TIMESTAMP => Written::GpuTimestamp,
         SYSTEM_TIMESTAMP => Written::SystemTimestamp,
         _ => Written::Value(value),

@@ -291,6 +291,156 @@ pub(crate) fn result(slot: u32) -> u64 {
     }
 }
 
+/// Whether the title's GPU timestamps (bottom-of-pipe writes with the
+/// timestamp flag) carry the card's own clock where the list stood
+/// (`VICTORY_CARD_TIMESTAMPS=1`; `alt`: twenty seconds with, twenty
+/// without, in turn, each change said in the log). Without it each is the
+/// CPU's clock when the list was seen to have run, so every stamp of a list
+/// is the same moment, and a pass timed by a pair of them took no time at
+/// all. The title writes about five a frame: a title that sets its
+/// resolution by the card's time would see a card with nothing to do.
+#[cfg(windows)]
+pub(crate) fn card_stamps() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_TIMESTAMPS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the title's GPU timestamps carry the card's clock from now (VICTORY_CARD_TIMESTAMPS=alt): {}",
+                    if on { "ON" } else { "off, the CPU's clock when the list has run" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Timestamp slots of the ring [`stamp`] records into (far more than are in
+/// the air at once: about five a frame).
+#[cfg(windows)]
+const STAMPS: u32 = 16384;
+
+/// The host's timestamp heap and its read-back buffer, mapped for good.
+#[cfg(windows)]
+struct Stamps {
+    heap: windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap,
+    back: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    data: *const u64,
+    /// The card's ticks per second.
+    frequency: u64,
+}
+// SAFETY: D3D12 objects are free-threaded; the mapping is only read, of
+// slots the card has written.
+#[cfg(windows)]
+unsafe impl Send for Stamps {}
+#[cfg(windows)]
+unsafe impl Sync for Stamps {}
+
+#[cfg(windows)]
+fn stamps() -> Option<&'static Stamps> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static STAMPS_MADE: std::sync::OnceLock<Option<Stamps>> = std::sync::OnceLock::new();
+    STAMPS_MADE
+        .get_or_init(|| {
+            let host = crate::host::host()?;
+            let device = host.device().clone();
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            // SAFETY: plain object creation.
+            unsafe {
+                device
+                    .CreateQueryHeap(
+                        &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
+                        &mut heap,
+                    )
+                    .ok()?;
+            }
+            let back = host.read_back_buffer(u64::from(STAMPS) * 8)?;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a read-back buffer of ours, mapped for its lifetime (the process's).
+            unsafe { back.Map(0, None, Some(&mut data)) }.ok()?;
+            // SAFETY: a live queue.
+            let frequency = unsafe { host.queue().GetTimestampFrequency() }.ok()?;
+            tracing::info!(frequency, "the card's clock for the title's GPU timestamps (VICTORY_CARD_TIMESTAMPS)");
+            Some(Stamps { heap: heap?, back, data: data.cast(), frequency: frequency.max(1) })
+        })
+        .as_ref()
+}
+
+/// With [`card_stamps`]: records the card's clock at this point of `list`
+/// into a slot of the ring and resolves it to the read-back buffer, for the
+/// title's timestamp write to carry ([`crate::queue::Written::CardTimestamp`]).
+/// `None` without the switch or the heap.
+#[cfg(windows)]
+pub(crate) fn stamp(list: &crate::host::HostList) -> Option<u32> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE_TIMESTAMP;
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !card_stamps() {
+        return None;
+    }
+    let s = stamps()?;
+    let slot = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % STAMPS;
+    // SAFETY: an open list, our heap and read-back buffer (in the copy
+    // destination state for good), the slot inside both.
+    unsafe {
+        list.list.EndQuery(&s.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot);
+        list.list.ResolveQueryData(&s.heap, D3D12_QUERY_TYPE_TIMESTAMP, slot, 1, &s.back, u64::from(slot) * 8);
+    }
+    Some(slot)
+}
+
+/// The card's clock in `slot` ([`stamp`]), once its list has run, on the
+/// title's GPU timestamp timeline: through the queue's clock calibration
+/// (the card's clock against the CPU's performance counter), taken again
+/// once a second.
+pub(crate) fn stamp_value(slot: u32) -> u64 {
+    #[cfg(windows)]
+    {
+        use crate::queue::{gpu_clock_at, qpc_frequency, system_timestamp};
+        let Some(s) = stamps() else {
+            return gpu_clock_at(system_timestamp());
+        };
+        // SAFETY: the slot of the mapping the card resolved into; its list has run.
+        let tick = unsafe { s.data.add(slot as usize).read_volatile() };
+        /// (card ticks, CPU counter, CPU counter when taken)
+        static CAL: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0));
+        let (gpu, cpu) = {
+            let mut cal = CAL.lock().unwrap_or_else(|e| e.into_inner());
+            let now = system_timestamp();
+            if cal.2 == 0 || now.saturating_sub(cal.2) > qpc_frequency() {
+                let (mut g, mut c) = (0u64, 0u64);
+                // SAFETY: a live queue and two out values.
+                if let Some(host) = crate::host::host()
+                    && unsafe { host.queue().GetClockCalibration(&mut g, &mut c) }.is_ok()
+                {
+                    *cal = (g, c, now);
+                }
+            }
+            (cal.0, cal.1)
+        };
+        if cpu == 0 {
+            return gpu_clock_at(system_timestamp());
+        }
+        let delta = i128::from(tick) - i128::from(gpu);
+        let qpc = i128::from(cpu) + delta * i128::from(qpc_frequency()) / i128::from(s.frequency);
+        gpu_clock_at(qpc.max(0) as u64)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = slot;
+        0
+    }
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         QUERY_HEAP,

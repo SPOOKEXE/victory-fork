@@ -640,6 +640,18 @@ What did it, on top of the list below:
   rest), which is what the wait does already. Passing the title's own
   scopes to the host's enhanced barriers would win little; what costs is
   the draining itself.
+- Levers for the card tried 2026-11-27, none of them a gain:
+  `VICTORY_DISPLAY_MODE=1920x1080` (the title still renders as before, card
+  ~64 ms, 8 fps); `VICTORY_CARD_TIMESTAMPS=1|alt` (new, off by default: the
+  title's GPU timestamps, about five a frame, carry the card's own clock
+  where the list stood instead of the CPU's when the list was seen done;
+  12.62 against 12.68 fps, the card no less busy, so the title does not set
+  its resolution by them); `VICTORY_ASYNC_PRESENT=alt` (12.94 against
+  12.92 fps); `VICTORY_DIRTY_4K=alt` (81 against 93 MB copied a frame,
+  12.6 against 12.2 fps: noise); `VICTORY_SHADER_LOOP_LIMIT=256` (the
+  heaviest program, the screen probes' ray binning `cb6adcc6`, 3-8 ms a
+  run against 13: its loops are the title's work, not runaway ones; its
+  translation has no group memory or wave emulation).
 - Frame rate, third session: measuring first (same RTX 4070, first room).
   - A frame log (`VICTORY_FRAME_LOG`, on in diagnostics builds): every
     frame's length, and for the usual frame and each long one what it was
