@@ -23,6 +23,35 @@ use std::time::{Duration, Instant};
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline, TargetFormats};
 
+/// `VICTORY_DENY_PIPELINES=<16-hex shader hash>,...` (off unless set): the
+/// hash of a shader of `shaders` that is listed there. Such a pipeline is
+/// never built (no driver compile) and counts as refused, so its draws and
+/// dispatches are dropped: a test of whether building a pipeline, rather
+/// than running it, is what loses the card (runs 281 and 318: the removal
+/// 32 and 81 ms after the 3-second build of `CS_RaytracingResolve` of the
+/// two-layer vehicle wheel material, 57a3fad03cac36af and d5b9c94a30d7cf28;
+/// gfx41). Unlike `VICTORY_SKIP_PIPELINES`, in release builds too.
+fn denied(shaders: &[Arc<Shader>]) -> Option<&str> {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_DENY_PIPELINES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    if list.is_empty() {
+        return None;
+    }
+    shaders.iter().find(|s| list.contains(&s.hash)).map(|s| s.hash.as_str())
+}
+
+/// The shaders of `p` (for logs).
+pub(crate) fn shaders(p: &Pending) -> &[Arc<Shader>] {
+    &p.shaders
+}
+
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
@@ -81,6 +110,10 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            if let Some(hash) = denied(&self.shaders) {
+                tracing::warn!(hash, shaders = ?self.shaders, "pipeline not built: its shader is in VICTORY_DENY_PIPELINES");
+                return None;
+            }
             let began = Instant::now();
             // A panic in the translator costs its pipeline, not the worker
             // and everything that waits for it.
