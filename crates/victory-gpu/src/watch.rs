@@ -188,6 +188,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     // one range at a time from six threads and stood in their lock most of
     // the time (345 of 375 ms a frame).
     if guard_ahead() {
+        let _span = crate::trace::span("ask ahead: the guards' walk of view memory");
         let mut k = 0;
         while k < views.len() {
             let (first, mut last) = views[k];
@@ -204,6 +205,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             }
         }
     }
+    let _span = crate::trace::span("ask ahead: the kernel, run by run");
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -301,10 +303,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // The light refresh: a few of the holes known by their bits are asked
     // of Windows again, a submission at a time ([`look_at_holes`]).
     if light_kept() {
+        let _span = crate::trace::span("ask once: holes looked at again");
         look_at_holes(HOLES_A_LOOK);
     }
     ask_once_end();
     ask_ahead(ranges);
+    let _span = crate::trace::span("ask once: ranges that lie alone");
     let mut j = contended(&JOURNAL, "journal lock wait");
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -654,7 +658,7 @@ fn failed_asking(start: usize, end: usize) {
     let (protected, clean, absent, viewed, aliased) = {
         let g = guards();
         let b = start / BLOCK;
-        (g.protected.contains(&b), g.clean.contains(&b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
+        (g.protected.contains(&b), CLEAN.has(b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
     };
     tracing::info!(
         "a failed write-watch asking (one in 2048): {start:#x}+{:#x}; Windows says (answered {n}): base {:#x} region {:#x} state {:#x} type {:#x} protect {:#x} allocation protect {:#x}; \
@@ -736,8 +740,6 @@ fn known_view(start: usize) -> bool {
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
-    /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -804,7 +806,6 @@ fn view_known() -> bool {
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
@@ -825,6 +826,13 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// Blocks read-only by our hand: a mirror of `Guards::protected` that the
 /// write handler reads without the lock.
 static OURS: Bits = Bits::new();
+/// Of the guarded blocks, the ones not written since a copy took them.
+/// Changed only with the guards' lock held. A bit per block, not a set:
+/// a frame asks about some 150,000 blocks of view memory, nearly all
+/// clean, and a range is answered word by word (`Bits::all`). As a tree
+/// set its range was copied out and walked at every asking: 9.6 ms a frame
+/// of the submitting thread (run V, "the guards' walk of view memory").
+static CLEAN: Bits = Bits::new();
 /// Blocks of `Guards::aliased`, for the same reader: a write to one opens
 /// other views too, which takes the lock.
 static ALIASED: Bits = Bits::new();
@@ -898,7 +906,7 @@ fn take_opened(g: &mut Guards) {
         let block = v - 1;
         if g.protected.remove(&block) {
             OURS.clear(block);
-            g.clean.remove(&block);
+            CLEAN.clear(block);
             PUBLISHED.clear(block);
             // Guarded again while the slot was being filled: writable now,
             // as the handler meant (see [`OPENED`]).
@@ -939,7 +947,9 @@ fn contended<T>(lock: &'static Mutex<T>, name: &'static str) -> std::sync::Mutex
 /// Whether the block `page` is read-only by our hand and unwritten since a
 /// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
 pub(crate) fn clean(page: usize) -> bool {
-    guards().clean.contains(&page)
+    // (under the guards' lock, as every change of the bits is made)
+    let _g = guards();
+    CLEAN.has(page)
 }
 
 /// `VICTORY_LIGHT_REFRESH`: 0 off, 1 on, 2 in turn ([`light`]).
@@ -1065,6 +1075,13 @@ impl Bits {
         }
     }
 
+    /// Whether `block`'s bit is set.
+    fn has(&self, block: usize) -> bool {
+        let word = block / 64;
+        self.piece(word)
+            .is_some_and(|piece| piece[word % BITS_WORDS].load(std::sync::atomic::Ordering::SeqCst) & (1u64 << (block % 64)) != 0)
+    }
+
     /// Whether the bits of all of `[first, last)` are set (not so of none).
     fn all(&self, first: usize, last: usize) -> bool {
         let mut block = first;
@@ -1086,7 +1103,7 @@ impl Bits {
 
 /// The blocks an asking can answer for from the journal alone. A block has
 /// its bit only while both of these hold: it is read-only by our hand and
-/// noted clean (`Guards::clean`), or it is a hole noted for good that lies
+/// noted clean ([`CLEAN`]), or it is a hole noted for good that lies
 /// in a placeholder reservation (`Guards::holes`); and the journal holds
 /// every write to it that an asking found.
 ///
@@ -1133,7 +1150,7 @@ fn publish(_noted: &Journal, written: &[usize], start: usize, end: usize, holes:
         let block = page * PAGE / BLOCK;
         // (Not one that a write has opened since the guards were asked,
         // nor one that could not be made read-only.)
-        if g.clean.contains(&block) {
+        if CLEAN.has(block) {
             PUBLISHED.set(block);
         }
     }
@@ -1498,23 +1515,16 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
+    // A frame asks about some 10 GB of view memory, 150,000 blocks, nearly
+    // all clean: the clean bits are read a word (64 blocks) at a time.
+    if CLEAN.all(first, last) {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
-    let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
-            next_clean += 1;
-        }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
+        // (what the loop marks clean is this block or ones before it)
+        let is_clean = block < last && CLEAN.has(block);
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
             // Found uncommitted a moment ago ([`absent_once`]): Windows is
@@ -1548,7 +1558,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
+                CLEAN.set(block);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1701,7 +1711,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         for block in from..to {
             OURS.set(block);
         }
-        g.clean.extend(from..to);
+        for block in from..to {
+            CLEAN.set(block);
+        }
         if view_known() {
             g.viewed.extend(from..to);
         }
@@ -1797,7 +1809,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         OURS.clear(block);
-        g.clean.remove(&block);
+        CLEAN.clear(block);
         // Before the block can be written ([`PUBLISHED`]; nothing to do
         // where no bit was ever set).
         PUBLISHED.clear(block);
@@ -2035,7 +2047,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         OURS.clear(block);
-        g.clean.remove(&block);
+        CLEAN.clear(block);
         // What it shows is new ([`PUBLISHED`]).
         PUBLISHED.clear(block);
     }
