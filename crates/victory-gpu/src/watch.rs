@@ -763,8 +763,115 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holes: BTreeSet::new(),
 });
 
+/// The guards' lock, with the blocks the write handler opened without it
+/// ([`OPENED`]) noted first.
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    contended(&GUARDS, "guards lock wait")
+    let mut g = contended(&GUARDS, "guards lock wait");
+    if OPENED_COUNT.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        take_opened(&mut g);
+    }
+    g
+}
+
+/// Blocks read-only by our hand: a mirror of `Guards::protected` that the
+/// write handler reads without the lock.
+static OURS: Bits = Bits::new();
+/// Blocks of `Guards::aliased`, for the same reader: a write to one opens
+/// other views too, which takes the lock.
+static ALIASED: Bits = Bits::new();
+
+/// Blocks the write handler gave write access back to without the guards'
+/// lock (a title thread waited on that lock 20 to 120 ms a frame while our
+/// refresh threads held it), not yet noted in `Guards`: `block + 1`, or
+/// [`OPENING`] while a handler is between taking a slot and filling it, or
+/// 0 (free). Noted by whoever takes the lock next ([`guards`]).
+///
+/// Why a block stays right. Until it is noted, the block is still in
+/// `protected` (and maybe `clean`), so nobody guards it again: `protect`
+/// and `protect_alias` only take blocks not in `protected`. The handler
+/// clears its [`PUBLISHED`] bit, then gives write access back, then fills
+/// the slot: an asking before the slot is noted sees the block clean, as
+/// it would have seen it while the handler waited for the lock before.
+/// The write is reported at the first asking after the note. A locked
+/// `open` of the block while a slot is being filled can have it guarded
+/// again before the slot lands; noting the slot then gives write access
+/// back once more, so `protected` never names a block that is writable
+/// nor misses one that is read-only.
+static OPENED: [std::sync::atomic::AtomicUsize; OPENED_SLOTS] = [const { std::sync::atomic::AtomicUsize::new(0) }; OPENED_SLOTS];
+const OPENED_SLOTS: usize = 4096;
+const OPENING: usize = usize::MAX;
+/// Filled slots of [`OPENED`].
+static OPENED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Where the next handler starts looking for a free slot.
+static OPENED_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The write handler's way without the lock: true if `block` was ours and
+/// is writable again, noted in [`OPENED`]. False (nothing done) for a
+/// block that is not ours alone or when every slot is taken: the handler
+/// takes the lock then.
+fn open_unlocked(block: usize) -> bool {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+    if !lock_free_faults() || !OURS.all(block, block + 1) || ALIASED.all(block, block + 1) {
+        return false;
+    }
+    let start = OPENED_NEXT.fetch_add(1, Relaxed);
+    let Some(slot) = (0..OPENED_SLOTS)
+        .map(|k| &OPENED[(start + k) % OPENED_SLOTS])
+        .find(|slot| slot.compare_exchange(0, OPENING, AcqRel, Acquire).is_ok())
+    else {
+        return false;
+    };
+    PUBLISHED.clear(block);
+    let mut old = 0;
+    // SAFETY: a block we made read-only.
+    unsafe {
+        crate::native::Protect(
+            (block * BLOCK) as *const _,
+            BLOCK,
+            windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            &mut old,
+        )
+    };
+    slot.store(block + 1, Release);
+    OPENED_COUNT.fetch_add(1, AcqRel);
+    true
+}
+
+/// Notes the blocks of [`OPENED`] as `open` would have (under the lock).
+fn take_opened(g: &mut Guards) {
+    use std::sync::atomic::Ordering::AcqRel;
+    for slot in &OPENED {
+        let v = slot.load(std::sync::atomic::Ordering::Acquire);
+        if v == 0 || v == OPENING || slot.compare_exchange(v, 0, AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+            continue;
+        }
+        OPENED_COUNT.fetch_sub(1, AcqRel);
+        let block = v - 1;
+        if g.protected.remove(&block) {
+            OURS.clear(block);
+            g.clean.remove(&block);
+            PUBLISHED.clear(block);
+            // Guarded again while the slot was being filled: writable now,
+            // as the handler meant (see [`OPENED`]).
+            let mut old = 0;
+            // SAFETY: a block we made read-only.
+            unsafe {
+                crate::native::Protect(
+                    (block * BLOCK) as *const _,
+                    BLOCK,
+                    windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                    &mut old,
+                )
+            };
+        }
+    }
+}
+
+/// Whether the write handler may open a block without the guards' lock
+/// (`VICTORY_LOCKFREE_FAULTS=0`: it always takes the lock).
+fn lock_free_faults() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCKFREE_FAULTS").is_none_or(|v| v != "0"))
 }
 
 /// Takes `lock`; a wait for another thread is timed as `name` in the frame
@@ -1476,6 +1583,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             for alias in shown {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
+                ALIASED.set(alias);
                 if alias != block {
                     protect_alias(g, alias);
                 }
@@ -1517,6 +1625,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     // SAFETY: title view memory; only its protection changes.
     if unsafe { crate::native::Protect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        OURS.set(block);
         if view_known() {
             g.viewed.insert(block);
         }
@@ -1540,6 +1649,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
+        for block in from..to {
+            OURS.set(block);
+        }
         g.clean.extend(from..to);
         if view_known() {
             g.viewed.extend(from..to);
@@ -1612,12 +1724,14 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+        ALIASED.clear(block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
             if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             g.aliased.remove(&(alias / BLOCK));
+            ALIASED.clear(alias / BLOCK);
         }
     }
     any
@@ -1633,6 +1747,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
+        OURS.clear(block);
         g.clean.remove(&block);
         // Before the block can be written ([`PUBLISHED`]; nothing to do
         // where no bit was ever set).
@@ -1870,6 +1985,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
+        OURS.clear(block);
         g.clean.remove(&block);
         // What it shows is new ([`PUBLISHED`]).
         PUBLISHED.clear(block);
@@ -1877,6 +1993,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+        ALIASED.clear(block);
     }
     if view_known() {
         // The runtime calls this for two things only (`xmem`: `map` and
@@ -1918,6 +2035,12 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        if open_unlocked(at / BLOCK) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            crate::framelog::add(crate::framelog::T::GuardFaults, 1);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
@@ -1954,6 +2077,7 @@ fn install() {
     // The switch is read here, not first in the handler ([`open`] asks
     // it): reading the environment allocates.
     light_kept();
+    lock_free_faults();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
