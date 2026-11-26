@@ -920,7 +920,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            // Where shaders write the source: on the card, in order.
+            let len = a.min(b) as usize;
+            if !list.card_copy(to as usize, from as usize, len) {
+                list.defer_copy(to, from, len);
+            }
         }
     }
     #[cfg(not(windows))]

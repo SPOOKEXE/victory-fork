@@ -2539,6 +2539,11 @@ fn card_fills() -> bool {
 
 /// Title buffer copies done on the card since the start ([`HostList::card_copy`]).
 pub(crate) static CARD_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Title buffer copies left to the CPU by [`HostList::card_copy`], since the
+/// start: the source where shaders have not written, no host copy of one
+/// side, the destination's copy not in the card's memory, a side not whole
+/// in its copy (or both in one).
+pub(crate) static CARD_COPIES_REFUSED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Constant buffers copied on the card since the start ([`HostList::card_fill`]).
 pub(crate) static CARD_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4019,14 +4024,16 @@ mod fill_ahead {
             "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT={}): {:.1} per \
              frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
              bytes a flight then changed, since the start: {}{}; {kept} fills kept to check; {learned} pieces of 64 KiB shaders \
-             changed, where fills wait; {} constant buffers and {} title buffer copies done on the card instead, since the start",
+             changed, where fills wait; {} constant buffers and {} title buffer copies done on the card instead, since the start \
+             (copies left to the CPU: {:?})",
             if mode() == Mode::Learn { "learn" } else { "0" },
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
             if WAIT.load(Relaxed) { " (fills wait again)" } else { "" },
             super::CARD_FILLS.load(Relaxed),
-            super::CARD_COPIES.load(Relaxed)
+            super::CARD_COPIES.load(Relaxed),
+            super::CARD_COPIES_REFUSED.each_ref().map(|c| c.load(Relaxed))
         );
     }
 
@@ -8715,16 +8722,26 @@ impl HostList {
     pub(crate) fn card_copy(&self, dst: usize, src: usize, len: usize) -> bool {
         const COPY_DEST: i32 = 0x400;
         const COPY_SOURCE: i32 = 0x800;
-        if !card_fills() || len == 0 || !shaders_wrote(src, len) {
+        let refused = |why: usize| {
+            CARD_COPIES_REFUSED[why].fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        if !card_fills() || len == 0 {
             return false;
         }
+        if !shaders_wrote(src, len) {
+            return refused(0);
+        }
         let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len as u64), crate::shadow::find(dst as u64, len as u64)) else {
-            return false;
+            return refused(1);
         };
         // Both whole inside their copies, and the destination's copy in the
         // card's memory (one the copy-back brings home).
-        if !to.carded() || from.left(src as u64) < len as u64 || to.left(dst as u64) < len as u64 || std::sync::Arc::ptr_eq(&from, &to) {
-            return false;
+        if !to.carded() {
+            return refused(2);
+        }
+        if from.left(src as u64) < len as u64 || to.left(dst as u64) < len as u64 || std::sync::Arc::ptr_eq(&from, &to) {
+            return refused(3);
         }
         // The source's CPU-side changes first, as for any read of it.
         from.refresh(self, src as u64, len as u64);
