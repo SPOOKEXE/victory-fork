@@ -63,8 +63,8 @@ struct State {
     summed: u32,
     since_ns: u64,
     vram: (u64, u64),
-    /// F9, Up, Down, Left, Right, F10, F8, F7, F1 as last seen.
-    keys: [bool; 9],
+    /// F9, Up, Down, Left, Right, F10, F8, F7, F1, F3 as last seen.
+    keys: [bool; 10],
     /// The time line (F7), kept only while it is up: spans of the last
     /// [`KEEP_NS`] (start ns, length ns, thread group, name), the presents'
     /// times, and the frame laid out at the last half second.
@@ -291,7 +291,7 @@ pub(crate) fn frame() {
         summed: 0,
         since_ns: now,
         vram: (0, 0),
-        keys: [false; 9],
+        keys: [false; 10],
         timeline: Default::default(),
         presents: Default::default(),
         laid: None,
@@ -300,13 +300,13 @@ pub(crate) fn frame() {
     {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         // SAFETY: plain queries.
-        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
+        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70, 0x72].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
         let pressed = |k: usize| down[k] && !s.keys[k];
         let front = focused();
         // F9 the processor's view, F10 the card's, F8 the memory's, F7 the
         // time line: the same key again hides it, another key switches to
         // its view.
-        for (key, view) in [(0, 0), (5, 1), (6, 2), (7, 3)] {
+        for (key, view) in [(0, 0), (5, 1), (6, 2), (7, 3), (9, 4)] {
             if pressed(key) && front {
                 if shown() && VIEW.load(Relaxed) == view {
                     SHOWN.store(false, Relaxed);
@@ -629,6 +629,12 @@ fn write_snapshot(snap: &Snap, laid: Option<&Laid>, vram: (u64, u64)) {
             let _ = writeln!(md, "| {g} | {} | {:.0} | {count} |", what.trim(), bytes as f64 / f64::from(1u32 << 20));
         }
     }
+    let _ = writeln!(md, "\n## System (the frame log's last reading)\n");
+    for line in crate::framelog::last_lines() {
+        for part in line.split(" | ") {
+            let _ = writeln!(md, "- {}", part.trim());
+        }
+    }
     crumbs_markdown(&mut md);
     let dir = std::path::Path::new("snapshots");
     let file = dir.join(format!("{seconds:08.1}.md"));
@@ -739,7 +745,21 @@ pub(crate) fn draw() -> Vec<u32> {
     let mut lines: Vec<(String, Option<(f64, f64, f64)>)> = Vec::new();
     let view = VIEW.load(Relaxed);
     let mut top = 32;
-    if view == 3 {
+    if view == 4 {
+        // The system (F3): the frame log's last reading, its parts a row each.
+        text_at(&mut px, 2, 22, "SYSTEM: THE FRAME LOG'S USUAL FRAME (EVERY 5 S)", HEAD);
+        for line in crate::framelog::last_lines().iter().skip(1).take(1) {
+            for part in line.split(" | ") {
+                let mut rest = part.trim();
+                while !rest.is_empty() {
+                    let cut = rest.char_indices().nth(80).map_or(rest.len(), |(i, _)| i);
+                    let cut = if cut < rest.len() { rest[..cut].rfind(' ').filter(|&i| i > 0).unwrap_or(cut) } else { cut };
+                    lines.push((rest[..cut].to_uppercase(), None));
+                    rest = rest[cut..].trim_start();
+                }
+            }
+        }
+    } else if view == 3 {
         top = draw_timeline(&mut px, s, &mut lines);
     } else if view == 2 {
         // Where the memory is: each row a bar against the card's budget

@@ -3236,6 +3236,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let _span = crate::trace::span("record: dispatch");
         // It may write the arguments a window holds clamped.
         self.window = None;
         self.gather_ends(list, true);
@@ -3548,6 +3549,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        let _span = crate::trace::span("record: mesh dispatch");
         self.window = None;
         self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
@@ -4065,6 +4067,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        let _span = crate::trace::span("record: draw");
         self.window = None;
         self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
@@ -4171,6 +4174,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        let _span = crate::trace::span("record: indexed draw");
         self.window = None;
         self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
@@ -4214,6 +4218,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        let _span = crate::trace::span("record: indirect");
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {

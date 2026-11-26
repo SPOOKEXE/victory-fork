@@ -530,6 +530,15 @@ fn long_over(usual: f64) -> f64 {
     (usual * 1.5).max(usual + 40_000.0)
 }
 
+/// The last reading's lines (every five seconds), for the overlay's system
+/// view (F3) and its snapshots.
+static LAST: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The last reading's lines ([`LAST`]).
+pub(crate) fn last_lines() -> Vec<String> {
+    LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// The lines of a reading: the frame times, the usual frame, the long ones.
 fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
     let over = long_over(usual);
@@ -629,9 +638,11 @@ pub fn frame() {
         state.recent.push_back(f.us);
     }
     let usual = median(state.recent.iter().copied());
-    for line in lines(&frames, usual, elapsed.as_secs_f64()) {
+    let said = lines(&frames, usual, elapsed.as_secs_f64());
+    for line in &said {
         tracing::info!("{line}");
     }
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = said;
     tracing::info!("{}", kinds(&frames));
 }
 
