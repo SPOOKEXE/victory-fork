@@ -21,7 +21,7 @@ mod backreads;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
-mod clock;
+pub mod clock;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -83,7 +83,7 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 mod tiles;
-mod trace;
+pub mod trace;
 pub mod signature;
 #[cfg(windows)]
 mod texture;

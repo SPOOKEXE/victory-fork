@@ -14,6 +14,10 @@
 //!   and the engine of every figure. For the whole card and for this
 //!   process: the busiest engine's sum, as the Task Manager does it. They
 //!   work for every maker of cards and load no library of the maker's.
+//! - In more detail ([`detail`], for the system view F3 and snapshots):
+//!   each logical processor (`NtQuerySystemInformation`), the processors
+//!   that share a last-level cache (a Ryzen's CCDs, from the host's `/sys`),
+//!   and the busiest threads by name.
 //! - Memory: this process's committed bytes and the PC's free physical
 //!   memory. (The card's memory is asked of the host by the box itself.)
 //!
@@ -42,6 +46,26 @@ pub(crate) struct Stats {
     pub(crate) ram_ours_mb: u32,
     /// The PC's free physical memory, MB.
     pub(crate) ram_free_mb: u32,
+}
+
+/// The same look in more detail, for the system view (F3, `crate::overlay`)
+/// and its snapshots: where the processor time went.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Detail {
+    /// Logical processors, per cent busy (all programs), by number.
+    pub(crate) processors: Vec<f32>,
+    /// Processors that share a last-level cache (a CCD of a Ryzen): its
+    /// processors' numbers and their mean per cent busy.
+    pub(crate) caches: Vec<(String, f32)>,
+    /// This process's busiest threads: name (or id), per cent of one processor.
+    pub(crate) threads: Vec<(String, f32)>,
+}
+
+static DETAIL: Mutex<Option<Detail>> = Mutex::new(None);
+
+/// The last look's [`Detail`]; none before the first.
+pub(crate) fn detail() -> Option<Detail> {
+    DETAIL.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The last look, and its number (1 for the first).
@@ -80,6 +104,99 @@ fn system_times() -> Option<(u64, u64)> {
     }
     // The kernel's time has the idle time in it.
     Some((ticks(&idle), ticks(&kernel) + ticks(&user)))
+}
+
+/// Each logical processor's (idle, busy and idle together), in 100 ns.
+fn processor_times() -> Vec<(u64, u64)> {
+    /// SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Times {
+        idle: i64,
+        kernel: i64,
+        user: i64,
+        dpc: i64,
+        interrupt: i64,
+        interrupts: u32,
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQuerySystemInformation(class: u32, info: *mut core::ffi::c_void, len: u32, returned: *mut u32) -> i32;
+    }
+    let mut times = vec![Times::default(); 256];
+    let mut returned = 0u32;
+    // SAFETY: a buffer of the size given; class 8 is the per-processor times.
+    let status = unsafe {
+        NtQuerySystemInformation(8, times.as_mut_ptr().cast(), (times.len() * size_of::<Times>()) as u32, &mut returned)
+    };
+    if status < 0 {
+        return Vec::new();
+    }
+    times.truncate(returned as usize / size_of::<Times>());
+    // The kernel's time has the idle time in it.
+    times.iter().map(|t| (t.idle as u64, (t.kernel + t.user) as u64)).collect()
+}
+
+/// The groups of logical processors that share a last-level cache, read
+/// once from the Linux host's `/sys` through Wine's `Z:` drive; none
+/// elsewhere. Processor numbers are taken to be the host's.
+fn caches() -> &'static [(String, Vec<usize>)] {
+    static CACHES: std::sync::OnceLock<Vec<(String, Vec<usize>)>> = std::sync::OnceLock::new();
+    CACHES.get_or_init(|| {
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        for cpu in 0..256 {
+            let dir = format!("Z:\\sys\\devices\\system\\cpu\\cpu{cpu}\\cache\\index3\\shared_cpu_list");
+            let Ok(list) = std::fs::read_to_string(dir) else { break };
+            let group = cpu_list(list.trim());
+            if !group.is_empty() && !groups.iter().any(|g| g.1 == group) {
+                groups.push((list.trim().to_owned(), group));
+            }
+        }
+        groups
+    })
+}
+
+/// "0-5,12-17" as numbers.
+fn cpu_list(text: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in text.split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    out.extend(a..=b);
+                }
+            }
+            None => out.extend(part.parse::<usize>().ok()),
+        }
+    }
+    out
+}
+
+/// A thread's name (`SetThreadDescription`, else the frame graph's group
+/// for it) and its id.
+fn thread_label(id: u32) -> String {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::System::Threading::{GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+    let mut name = String::new();
+    // SAFETY: a handle opened and closed here; the system allocates the
+    // string, freed with LocalFree.
+    unsafe {
+        let thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, id);
+        if !thread.is_null() {
+            let mut text: *mut u16 = std::ptr::null_mut();
+            if GetThreadDescription(thread, &mut text) >= 0 && !text.is_null() {
+                let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+                name = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                LocalFree(text.cast());
+            }
+            CloseHandle(thread);
+        }
+    }
+    if name.is_empty() {
+        // (a title thread without a description: the group its spans go under)
+        name = crate::overlay::thread_group(id).unwrap_or_else(|| "thread".to_owned());
+    }
+    format!("{name} ({id})")
 }
 
 /// This process's processor time, in 100 ns.
@@ -261,6 +378,7 @@ fn run() {
     // SAFETY: a plain call.
     let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
     let mut last = (Instant::now(), system_times(), process_time(), thread_times());
+    let mut last_processors = processor_times();
     let mut looks = 0u64;
     loop {
         std::thread::sleep(Duration::from_secs(1));
@@ -285,6 +403,33 @@ fn run() {
             .unwrap_or(0) as f64
             / wall
             * 100.0;
+        let processors_now = processor_times();
+        let busy: Vec<f32> = processors_now
+            .iter()
+            .zip(&last_processors)
+            .map(|(&(idle1, all1), &(idle0, all0))| match all1.saturating_sub(all0) {
+                0 => 0.0,
+                all => (100.0 * (1.0 - idle1.saturating_sub(idle0) as f64 / all as f64)).clamp(0.0, 100.0) as f32,
+            })
+            .collect();
+        last_processors = processors_now;
+        let caches = caches()
+            .iter()
+            .filter(|(_, g)| g.iter().all(|&c| c < busy.len()))
+            .map(|(list, g)| {
+                let mean = g.iter().map(|&c| busy[c]).sum::<f32>() / g.len().max(1) as f32;
+                (format!("processors {list}, one cache"), mean)
+            })
+            .collect();
+        let mut threads: Vec<(u32, f64)> = now
+            .3
+            .iter()
+            .map(|(id, &t)| (*id, t.saturating_sub(last.3.get(id).copied().unwrap_or(t)) as f64 / wall * 100.0))
+            .filter(|t| t.1 >= 1.0)
+            .collect();
+        threads.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let threads = threads.iter().take(12).map(|&(id, p)| (thread_label(id), p.clamp(0.0, 100.0) as f32)).collect();
+        *DETAIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Detail { processors: busy, caches, threads });
         let looked = engines.as_mut().and_then(Engines::look);
         let (gpu_all, gpu_ours) = match &looked {
             Some(e) => (Some(busiest(e, None).0), Some(busiest(e, Some(pid)).0)),
@@ -336,6 +481,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_cpu_list_reads_as_numbers() {
+        assert_eq!(cpu_list("0-2,12-13"), vec![0, 1, 2, 12, 13]);
+        assert_eq!(cpu_list("7"), vec![7]);
+        assert_eq!(cpu_list(""), Vec::<usize>::new());
+    }
+
+    #[test]
     fn an_instance_name_says_the_process_and_the_engine() {
         assert_eq!(parse_instance("pid_1234_luid_0x00000000_0x0000E3B5_phys_0_eng_0_engtype_3D"), Some((1234, "3D")));
         assert_eq!(parse_instance("pid_8_luid_0x0_0x1_phys_0_eng_5_engtype_Compute_0"), Some((8, "Compute_0")));
@@ -370,6 +522,7 @@ mod tests {
         assert!(process_time() > 0);
         let threads = thread_times();
         assert!(!threads.is_empty(), "this process has threads");
+        assert!(!processor_times().is_empty(), "the processors' own times");
         let (ours, free) = memory();
         assert!(ours > 0 && free > 0);
     }

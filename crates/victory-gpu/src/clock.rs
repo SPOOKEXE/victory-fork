@@ -61,7 +61,7 @@ fn scale() -> &'static Scale {
 }
 
 /// Nanoseconds since the first call to this module.
-pub(crate) fn now_ns() -> u64 {
+pub fn now_ns() -> u64 {
     let s = scale();
     #[cfg(target_arch = "x86_64")]
     if s.per_ns > 0.0 {

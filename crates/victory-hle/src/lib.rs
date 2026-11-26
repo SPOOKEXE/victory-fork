@@ -15,6 +15,7 @@ mod host;
 pub mod modules;
 mod registry;
 pub mod runtime;
+mod timing;
 
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
@@ -36,7 +37,7 @@ impl HleResolver {
 
     /// Where an import would come from, without binding anything.
     pub fn classify(&self, dll: &str, symbol: &ImportSymbol) -> Option<Provenance> {
-        match self.resolve(dll, symbol) {
+        match self.find(dll, symbol) {
             Resolution::Found { provenance, .. } => Some(provenance),
             Resolution::Missing => None,
         }
@@ -44,7 +45,27 @@ impl HleResolver {
 }
 
 impl ImportResolver for HleResolver {
+    /// [`find`](Self::find), with our functions and the host's waits behind
+    /// timing stubs when imports are timed ([`timing`]).
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        match self.find(dll, symbol) {
+            Resolution::Found { address, provenance } if timing::on() => {
+                let name = symbol.to_string();
+                let address = match provenance {
+                    Provenance::Hle => timing::wrap(address, format!("hle: {name}")),
+                    Provenance::Host if timing::host_timed(&name) => timing::wrap(address, format!("host: {name}")),
+                    _ => address,
+                };
+                Resolution::Found { address, provenance }
+            }
+            found => found,
+        }
+    }
+}
+
+impl HleResolver {
+    /// Where an import binds: an implementation of ours, the host's, or none.
+    fn find(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         // Ordinal imports look up `#n`.
         if let Some(address) = registry::lookup(dll, &symbol.to_string()) {
             return Resolution::Found {

@@ -214,6 +214,11 @@ pub(crate) fn gpu_span(name: &str, us: u64) {
     }
 }
 
+/// The name a thread's spans are grouped under, if it timed any.
+pub(crate) fn thread_group(tid: u32) -> Option<String> {
+    THREADS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&tid).cloned()
+}
+
 /// A thread's name, once, as it first times a span.
 pub(crate) fn thread_name(tid: u32, name: &str) {
     let group = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-' || c == ' ');
@@ -345,6 +350,8 @@ pub(crate) fn frame() {
                 gpu: HashMap::new(),
             });
             RECORDING.store(true, Relaxed);
+            // (the machine's load, looked at every second, for the snapshot)
+            crate::stats::start();
             tracing::info!("snapshot: recording {} s", SNAP_NS as f64 / 1e9);
         }
         s.keys = down;
@@ -629,6 +636,17 @@ fn write_snapshot(snap: &Snap, laid: Option<&Laid>, vram: (u64, u64)) {
             let _ = writeln!(md, "| {g} | {} | {:.0} | {count} |", what.trim(), bytes as f64 / f64::from(1u32 << 20));
         }
     }
+    let _ = writeln!(md, "\n## Machine load over the last second\n\n| what | % |\n|---|---:|");
+    for (label, percent) in machine_rows() {
+        match percent {
+            Some(p) => {
+                let _ = writeln!(md, "| {label} | {p:.0} |");
+            }
+            None => {
+                let _ = writeln!(md, "| **{label}** | |");
+            }
+        }
+    }
     let _ = writeln!(md, "\n## System (the frame log's last reading)\n");
     for line in crate::framelog::last_lines() {
         for part in line.split(" | ") {
@@ -642,6 +660,41 @@ fn write_snapshot(snap: &Snap, laid: Option<&Laid>, vram: (u64, u64)) {
         Ok(()) => tracing::info!("snapshot written: {}", std::fs::canonicalize(&file).unwrap_or(file).display()),
         Err(e) => tracing::warn!(error = %e, "snapshot not written"),
     }
+}
+
+/// The machine's load from `crate::stats` as rows: a heading (no figure) or
+/// a label and its per cent. Processors in per cent busy; threads in per cent
+/// of one processor (a thread at 100 holds the frame if the card is idle);
+/// the card's busiest engine.
+fn machine_rows() -> Vec<(String, Option<f32>)> {
+    let mut rows = Vec::new();
+    if let Some((_, s)) = crate::stats::now() {
+        rows.push(("machine".to_owned(), None));
+        rows.push(("processors, all programs".to_owned(), Some(s.cpu_all)));
+        let processors = std::thread::available_parallelism().map_or(1, |n| n.get()) as f32;
+        rows.push((format!("this process: {:.1} of {processors:.0} processors", s.cores), Some(s.cores / processors * 100.0)));
+        if let Some(g) = s.gpu_all {
+            rows.push(("card's busiest engine, all programs".to_owned(), Some(g)));
+        }
+        if let Some(g) = s.gpu_ours {
+            rows.push(("card's busiest engine, this process".to_owned(), Some(g)));
+        }
+    }
+    if let Some(d) = crate::stats::detail() {
+        if !d.caches.is_empty() {
+            rows.push(("processors by shared cache (ccd)".to_owned(), None));
+            rows.extend(d.caches.iter().map(|(label, p)| (label.clone(), Some(*p))));
+        }
+        if !d.threads.is_empty() {
+            rows.push(("busiest threads, % of one processor".to_owned(), None));
+            rows.extend(d.threads.iter().map(|(label, p)| (label.clone(), Some(*p))));
+        }
+        if !d.processors.is_empty() {
+            rows.push(("each processor".to_owned(), None));
+            rows.extend(d.processors.iter().enumerate().map(|(i, p)| (format!("processor {i}"), Some(*p))));
+        }
+    }
+    rows
 }
 
 /// The last breadcrumbs report (`crate::host`'s, when the card has not finished
@@ -746,8 +799,17 @@ pub(crate) fn draw() -> Vec<u32> {
     let view = VIEW.load(Relaxed);
     let mut top = 32;
     if view == 4 {
-        // The system (F3): the frame log's last reading, its parts a row each.
-        text_at(&mut px, 2, 22, "SYSTEM: THE FRAME LOG'S USUAL FRAME (EVERY 5 S)", HEAD);
+        // The system (F3): the machine's load over the last second as bars
+        // (per cent), then the frame log's last reading, its parts a row each.
+        text_at(&mut px, 2, 22, "SYSTEM: LOAD OVER THE LAST SECOND, THEN THE FRAME LOG'S USUAL FRAME", HEAD);
+        crate::stats::start();
+        for (label, percent) in machine_rows() {
+            match percent {
+                Some(p) => lines.push((label.to_uppercase(), Some((f64::from(p), 0.0, 100.0)))),
+                None => lines.push((label.to_uppercase(), None)),
+            }
+        }
+        lines.push(("THE FRAME LOG (EVERY 5 S)".to_owned(), None));
         for line in crate::framelog::last_lines().iter().skip(1).take(1) {
             for part in line.split(" | ") {
                 let mut rest = part.trim();
@@ -838,6 +900,8 @@ pub(crate) fn draw() -> Vec<u32> {
                     2 => format!("{v:7.0}{count:7.0}"),
                     // (the time line: the span's length and its share of the frame, %)
                     3 => format!("{v:6.1}{count:5.0}%"),
+                    // (the system: per cent)
+                    4 => format!("{v:11.0}%"),
                     _ => format!("{v:6.1}{count:6.1}"),
                 };
                 text_at(&mut px, bar_x + bar_w + 4, y, &numbers, TEXT);

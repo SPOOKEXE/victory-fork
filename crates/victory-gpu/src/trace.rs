@@ -133,6 +133,25 @@ pub(crate) fn waited(name: &'static str, tid: u32, at: u64) {
     push(Event::Span(name, tid, at, len, 0));
 }
 
+/// A span `name` on the calling thread's track from `at` (a [`crate::clock`]
+/// reading, `now_ns`) to now: for timings made outside this crate (the title's
+/// calls into the runtime, `victory-hle`'s import timing).
+pub fn timed(name: &'static str, at: u64) {
+    if !on() {
+        return;
+    }
+    let len = crate::clock::now_ns().saturating_sub(at);
+    let tid = thread();
+    #[cfg(windows)]
+    crate::overlay::span(name, tid, at, len);
+    push(Event::Span(name, tid, at, len, 0));
+}
+
+/// Whether spans are timed now ([`on`]), for timings made outside this crate.
+pub fn timing() -> bool {
+    on()
+}
+
 /// Times the caller's scope as `name` on this thread's track.
 pub(crate) fn span(name: &'static str) -> Option<Span> {
     on().then(|| Span { name, at: crate::clock::now_ns(), arg: 0 })
