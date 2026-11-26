@@ -330,8 +330,13 @@ pub(crate) fn frame() {
     {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         // SAFETY: plain queries.
-        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70, 0x72].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
-        let pressed = |k: usize| down[k] && !s.keys[k];
+        // Held now (the high bit), and pressed since the last look (the low
+        // bit): at 6 fps the looks are 170 ms apart, and a tap between two
+        // of them was never seen (F1 "did nothing").
+        let state = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70, 0x72].map(|vk| unsafe { GetAsyncKeyState(vk) });
+        let down = state.map(|k| k < 0);
+        let tapped = state.map(|k| k & 1 != 0);
+        let pressed = |k: usize| (down[k] && !s.keys[k]) || (tapped[k] && !down[k]);
         let front = focused();
         // F9 the processor's view, F10 the card's, F8 the memory's, F7 the
         // time line: the same key again hides it, another key switches to

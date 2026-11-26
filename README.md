@@ -568,9 +568,10 @@ What did it, on top of the list below:
     a frame down to 6 to 19, no fill seen to miss); up to 512 idle
     host lists and texture staging buffers are reused instead of made and
     freed every frame.
-  - `VICTORY_CARD_FILLS=1`: constant buffers that read where shaders
-    write are copied by the card, in the list, instead of by the CPU after
-    the flights land (no wait for them; more card time, off by default).
+  - `VICTORY_CARD_FILLS=0`: constant buffers that read where shaders
+    write are copied by the CPU after the flights land, as before; by
+    default the card copies them in the list, in order, and nothing waits
+    for the flights (café: 160 ms frames to 98 at the same moment).
   - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
     the layer; it is how the above was found.
 - Frame rate, third session: measuring first (same RTX 4070, first room).

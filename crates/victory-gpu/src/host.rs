@@ -2526,14 +2526,15 @@ const SPARE_MOST: u64 = 128 << 20;
 /// freed per frame of gameplay (run 60).
 /// `VICTORY_SCRATCH_POOL=0`: chunks of 4 MiB kept by their list, as before.
 /// Whether constant buffers that read where shaders write are copied on
-/// the card ([`HostList::card_fill`]; `VICTORY_CARD_FILLS=1`). Off by
-/// default: in the café it took the submitting thread's waits for flights
-/// from 20 to 60 ms a frame to under 15, but about 180 copies a frame, each
-/// between full barriers, and the card's time per frame went up (170 ms
-/// against 128 in runs O and P, scenes not quite alike); no faster frame.
+/// the card ([`HostList::card_fill`]; on unless `VICTORY_CARD_FILLS=0`).
+/// Runs W and X, the same scenes at the same moments: frames 160 and 114 ms
+/// against 98 and 99, the submitting thread 142 and 110 ms against 88 and
+/// 87, the card's own time 103 ms against 87 (fewer flights waited for
+/// left it less idle). Runs O and P had seemed to say the card paid for it,
+/// but their scenes differed.
 fn card_fills() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILLS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILLS").is_none_or(|v| v != "0"))
 }
 
 /// Constant buffers copied on the card since the start ([`HostList::card_fill`]).
@@ -8565,7 +8566,7 @@ impl HostList {
     /// A constant buffer at `address` (`len` bytes, in `shadow`) the list
     /// reads at an address not 256-byte aligned, copied on the card, here in
     /// the list, into card memory of the list's own: its address there, or
-    /// none if [`card_fills`] is off (the default) or the list's room is used up.
+    /// none if [`card_fills`] is off or the list's room is used up.
     ///
     /// Why: such a buffer is otherwise copied by the CPU when the list is
     /// submitted ([`HostList::defer_fill`]), and where shaders write those
