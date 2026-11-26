@@ -1415,11 +1415,11 @@ fn crumbs_report(what: &str) {
          (0xfff1: our send-and-hash list, 0xfff2: our compare list, low 0xfffe: a list just started); \
          recordings {begun_id} begun, {done_id} done"
     );
-    // A recording reset since: its texts were kept.
+    // A recording closed or reset since: its texts were kept.
     {
         let kept = CRUMB_KEPT.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, notes, pipelines)) = kept.iter().rev().find(|k| k.0 == begun_id) {
-            tracing::error!("breadcrumbs: recording {begun_id} (reset since; kept), its pipelines: {pipelines:?}");
+            tracing::error!("breadcrumbs: recording {begun_id} (kept when it closed), its pipelines: {pipelines:?}");
             let done = if done_id == begun_id { done & 0xffff } else { 0 };
             crumbs_print(notes, done);
             return;
@@ -7142,6 +7142,15 @@ impl HostList {
         );
         #[cfg(feature = "diagnostics")]
         crate::shot::close(self);
+        // With breadcrumbs on, the recording's texts as it closes: a hang
+        // report finds them even when the list has since been given out
+        // again or its texts were not where the report looked.
+        #[cfg(feature = "diagnostics")]
+        if crumbs_on() {
+            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            crumbs_keep(crumb_list(self), notes, pipelines);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
