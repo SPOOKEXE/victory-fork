@@ -1195,16 +1195,23 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    /// In every build, so release runs can be driven and measured too.
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold>],...` holds each
+    /// key that long after input starts, with or without focus, for `hold`
+    /// seconds (0.2 if not given): `120:Enter:60` holds A for a minute, which
+    /// skips cinematics. A key is a letter, a digit, or `Enter`, `Esc`, `Tab`,
+    /// `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's table maps
+    /// them to buttons: Enter is A). In every build, so release runs can be
+    /// driven and measured too.
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
+                let mut parts = entry.split(':');
+                let (at, key) = (parts.next()?, parts.next()?);
+                let hold = match parts.next() {
+                    Some(h) => Duration::try_from_secs_f64(h.trim().parse().ok()?).ok()?,
+                    None => Duration::from_millis(200),
+                };
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1221,6 +1228,7 @@ mod host {
                 };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                    hold,
                     vk,
                 ))
             });
@@ -1229,8 +1237,8 @@ mod host {
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, hold, _)| (at..at + hold).contains(&now))
+            .map(|&(_, _, vk)| vk)
             .collect()
     }
 
