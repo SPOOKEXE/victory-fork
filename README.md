@@ -623,8 +623,12 @@ What did it, on top of the list below:
     copies and about 400 made anew. No copy was given back in them (none
     was used again within 30 s), so what they had is the later freeing.
     The new start alone, freeing at once, lost the card 6 s after its
-    first sweep (one run). What goes wrong with a copy made anew is not
-    known yet.
+    first sweep (one run). Later a run lost it one second into a burst of
+    passes of 1,000 to 3,200 copies, with every copy let go still kept and
+    none made anew or given back, so it follows a large pass whatever is
+    done with the copies. A pass now lets go at most 128, the longest
+    unused first: one run of 20 minutes, 85 passes, 10,880 let go, no loss.
+    What the card trips on is not known yet.
 - The title's barriers, measured (RTX 4090, run 2026-11-27): about 860
   barrier groups a frame order shader writes, each a wait for every
   earlier shader write here. Left out (`VICTORY_BARRIER_TEST=groups`, a

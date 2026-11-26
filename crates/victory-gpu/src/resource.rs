@@ -1822,7 +1822,29 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
+    // The longest unused first, and no more than [`SWEEP_MOST`] a pass.
+    let mut idle: Vec<(u64, usize)> = all
+        .iter()
+        .filter_map(|&at| {
+            // SAFETY: as below.
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                return None;
+            }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let used = r.host.used.load(Relaxed);
+            made.as_ref()
+                .is_some_and(|(host, _)| {
+                    crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                })
+                .then_some((used, at))
+        })
+        .collect();
+    idle.sort_unstable();
+    idle.truncate(SWEEP_MOST);
+    for (_, at) in idle {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
@@ -1869,6 +1891,17 @@ pub(crate) fn let_go_idle() {
         });
     }
 }
+
+/// Host copies [`let_go_idle`] looks at in one pass, the longest unused
+/// first (it runs about once a second).
+///
+/// Why: with no more than that, the sweep never lets thousands go at once.
+/// Runs whose sweep let go 2,500 to 28,000 copies in a pass lost the card
+/// one to six seconds later (Xid 13), twice; once with every copy let go
+/// still alive ([`grace`]) and none made anew or given back, so what the
+/// card trips on is not known, only that it follows such a pass.
+#[cfg(windows)]
+const SWEEP_MOST: usize = 128;
 
 /// Host copies [`let_go_idle`] let go, kept [`grace::MS`] before they are
 /// retired: a title texture used again in that time gets its own copy back
