@@ -391,7 +391,23 @@ fn lay_out(
         let (a, b) = (start.max(from), (start + len).min(to));
         out.push((ms(a - from), ms(b - a), g, depth, name));
     }
-    Some(Laid { ms: ms(to - from), spans: out })
+    // The title's own work on its render thread: where none of ours runs there
+    // (the game's code between its calls into the layer), as spans of its own
+    // so that the time line has no unexplained gaps.
+    let mut ours: Vec<(f64, f64)> =
+        out.iter().filter(|s| s.2 == 0 && s.3 == 0).map(|s| (s.0, s.0 + s.1)).collect();
+    ours.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut at, end) = (0.0, ms(to - from));
+    for (a, b) in ours {
+        if a > at + 0.05 {
+            out.push((at, a - at, 0, 0, "the title's own work"));
+        }
+        at = at.max(b);
+    }
+    if end > at + 0.05 {
+        out.push((at, end - at, 0, 0, "the title's own work"));
+    }
+    Some(Laid { ms: end, spans: out })
 }
 
 /// A colour for span `name`, the same every frame.
@@ -792,9 +808,11 @@ mod timeline_tests {
         .collect();
         let laid = super::lay_out(&timeline, &presents, now).expect("a frame");
         assert_eq!(laid.ms, 100.0);
-        assert_eq!(laid.spans.len(), 3);
         let find = |name| laid.spans.iter().find(|s| s.4 == name).copied().unwrap();
-        assert_eq!(find("submit").3, 0);
+        // (and the title's own work filling its render thread, which has none of ours here)
+        assert_eq!(laid.spans.len(), 4);
+        assert_eq!(find("the title's own work").1, 100.0);
+                assert_eq!(find("submit").3, 0);
         assert_eq!(find("copies").3, 1);
         assert_eq!((find("copies").0, find("copies").1), (20.0, 10.0));
         assert_eq!((find("list").0, find("list").1), (0.0, 20.0));

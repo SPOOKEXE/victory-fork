@@ -1330,10 +1330,18 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         // (With `behind`: what the queues hold runs here first, and what
         // it sent is settled with the rest.)
         if behind() {
+            let _span = crate::trace::span("present: run what queues hold");
             release_held_now(false);
         }
-        crate::host::settle_for_present();
-        release_held_now(false);
+        {
+            let _span = crate::trace::span("present: wait for the frame's submissions");
+            crate::host::settle_for_present();
+        }
+        {
+            let _span = crate::trace::span("present: run what queues hold");
+            release_held_now(false);
+        }
+        let _span = crate::trace::span("present: wait for the frame's submissions");
         crate::host::settle_for_present();
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
@@ -1409,7 +1417,10 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let shown = {
+            let _span = crate::trace::span("present: show the frame");
+            host.present(texture, state, frame)
+        };
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
