@@ -368,7 +368,11 @@ pub(crate) fn frame() {
             let snap = s.snap.take().expect("checked");
             RECORDING.store(false, Relaxed);
             let laid = lay_out(&s.timeline, &s.presents, now);
-            write_snapshot(&snap, laid.as_ref(), s.vram);
+            // (the card's memory now: the overlay takes it only while it is up)
+            let vram = crate::host::host()
+                .and_then(|h| h.video_memory())
+                .map_or(s.vram, |[budget, used, ..]| (used >> 20, budget >> 20));
+            write_snapshot(&snap, laid.as_ref(), vram);
         }
     }
     if (VIEW.load(Relaxed) == 3 && shown()) || s.snap.is_some() {
