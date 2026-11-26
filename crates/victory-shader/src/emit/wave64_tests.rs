@@ -607,3 +607,102 @@ fn console_waves_of_one_group_that_branch_apart_meet_by_halves() {
     }
     eprintln!("ran on the hardware device: each console wave's OR, whichever waves go in");
 }
+
+/// [`console_waves_of_one_group_that_branch_apart_meet_by_halves`] 500 times in a loop, the
+/// values changing each time (every thread adds the loop counter to its bit before the OR),
+/// each console wave summing its ORs: a half that went on before the other had given its
+/// value, or read a value of another round, shows in the sum.
+#[test]
+fn halves_meeting_in_a_loop_exchange_each_rounds_values() {
+    const ROUNDS: u32 = 500;
+    let mut words = vec![
+        0x7E10_0300, // v_mov_b32 v8, v0
+        0x7E14_0280, // v_mov_b32 v10, 0
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0xB014_0000 | ROUNDS, // s_movk_i32 s20, ROUNDS
+    ];
+    let top = words.len();
+    words.extend_from_slice(&[
+        0x4A0E_0E14, // v_add_nc_u32 v7, s20, v7
+        0x7D88_1000, // v_cmp_gt_u32 vcc, s0, v8
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000, // s_cbranch_execz to the restore of EXEC (filled in below)
+    ]);
+    let skip = words.len() - 1;
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x4A14_1407, // v_add_nc_u32 v10, s7, v10
+        0x2C12_1086, // v_lshrrev_b32 v9, 6, v8
+        0x3412_1282, // v_lshlrev_b32 v9, 2, v9
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 10 << 8 | 9, // buffer_store_dword v10, v9, s[8:11], 0 offen
+    ]);
+    words[skip] |= (words.len() - skip - 1) as u32;
+    words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    words.push(0x8114_C114); // s_add_i32 s20, s20, -1
+    words.push(0xBF07_8014); // s_cmp_lg_u32 s20, 0
+    let back = (top as i32 - (words.len() as i32 + 1)) as u16;
+    words.push(0xBF85_0000 | u32::from(back)); // s_cbranch_scc1 to the top
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    // the console's sums: in round r (counter ROUNDS - r) thread t holds its bit plus every
+    // counter so far; the threads below s0 of a wave OR theirs
+    let sums = |below: u32| -> [u32; 2] {
+        let mut v7: Vec<u32> = (0..128u32).map(|t| 1 << (t >> 1 & 31)).collect();
+        let mut sum = [0u32; 2];
+        for counter in (1..=ROUNDS).rev() {
+            for v in &mut v7 {
+                *v = v.wrapping_add(counter);
+            }
+            for (w, s) in sum.iter_mut().enumerate() {
+                let lanes = (64 * w as u32..64 * w as u32 + 64).filter(|&t| t < below);
+                let or = lanes.clone().fold(0, |a, t| a | v7[t as usize]);
+                if lanes.count() > 0 {
+                    *s = s.wrapping_add(or);
+                }
+            }
+        }
+        sum
+    };
+    for below in [128u32, 100, 40] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!([out[0][0], out[0][1]], sums(below), "{below} threads in the branch");
+    }
+    eprintln!("ran on the hardware device: {ROUNDS} rounds of exchanges, every sum the console's");
+}
