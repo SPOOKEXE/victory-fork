@@ -8419,11 +8419,11 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        self.refresh_textures();
         self.index.clear();
-        // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // One write-watch asking (and one pass of the guards) for the
+        // copies and the textures' memory that lie close together, not one
+        // per copy or texture.
+        let ahead = self.refreshes.len() + self.staged.len() > 1;
         if ahead {
             let _span = crate::trace::span("write-watch ask");
             let started = std::time::Instant::now();
@@ -8432,10 +8432,15 @@ impl Batch {
                 .iter()
                 .filter(|r| !r.0.unwatched())
                 .map(|r| (r.1, r.2))
+                .chain(self.staged.iter().map(|t| {
+                    let (at, len) = t.memory();
+                    (at, at + len)
+                }))
                 .collect();
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
         }
+        self.refresh_textures();
         let mut _span = crate::trace::span("refreshes");
         if let Some(span) = &mut _span {
             span.arg(self.refreshes.len() as u64);

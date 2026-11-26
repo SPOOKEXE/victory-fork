@@ -121,6 +121,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     pieces.sort_unstable();
     let mut j = contended(&JOURNAL, "journal lock wait");
+    // Askings in flight over these pages put what they found in first.
+    while j.in_flight.iter().any(|&(a, b)| pieces.iter().any(|&(f, l)| a < l && f < b)) {
+        let _span = crate::trace::span("journal overlap wait");
+        j = IN_FLIGHT.wait(j).unwrap_or_else(|e| e.into_inner());
+    }
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -135,12 +140,35 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     // triippywhale d0581a55). `VICTORY_VIEW_ASK=1` asks as before.
     #[cfg(feature = "diagnostics")]
     let all = pieces.len();
-    pieces.retain(|&(first, _)| !known_view(first * PAGE));
+    let (views, others): (Vec<_>, Vec<_>) = pieces.into_iter().partition(|&(first, _)| known_view(first * PAGE));
+    pieces = others;
     #[cfg(feature = "diagnostics")]
     AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    // View memory: the guards are asked here too, once per run of ranges
+    // that touch, on this one thread (`VICTORY_GUARD_AHEAD=0`: left to
+    // `writes`, each range on its own). The wide refreshes asked the guards
+    // one range at a time from six threads and stood in their lock most of
+    // the time (345 of 375 ms a frame).
+    if guard_ahead() {
+        let mut k = 0;
+        while k < views.len() {
+            let (first, mut last) = views[k];
+            k += 1;
+            while k < views.len() && views[k].0 <= last {
+                last = last.max(views[k].1);
+                k += 1;
+            }
+            if let Some(written) = guard(first * PAGE, last * PAGE) {
+                for page in written {
+                    j.written.insert(page, j.ahead_asked);
+                }
+                j.ahead.push((first, last));
+            }
+        }
+    }
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -156,6 +184,13 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         ask_run(j, &pieces[i..k]);
         i = k;
     }
+}
+
+/// Whether [`ask_ahead`] asks the guards about a submission's view memory
+/// too (`VICTORY_GUARD_AHEAD=0`: not).
+fn guard_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_AHEAD").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
