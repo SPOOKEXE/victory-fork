@@ -178,6 +178,10 @@ default VICTORY_SETTLE_ROOM 1
 # each write of ours (the parent's VICTORY_PARALLEL_REFRESH): run AF, on and
 # off every 20 s, about 4 ms less of the submitting thread's preparing.
 default VICTORY_PARALLEL_REFRESH 1
+# Parts that follow one another in the queues' lines go to the host as one
+# submission, prepared once (run BB, on and off every 20 s in gameplay: the
+# submitting thread's preparing about 42 to 33 ms a frame).
+default VICTORY_JOIN_PARTS 1
 # Fills of upload memory wait for flights only where shaders have written
 # this run (one wait a frame in the café instead of two).
 default VICTORY_FILL_WAIT learn
