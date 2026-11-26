@@ -5779,7 +5779,7 @@ impl Host {
             }
         }
         if last > 0 {
-            FINISHED.store(last, Ordering::Release);
+            FINISHED.fetch_max(last, Ordering::AcqRel);
             bury(last);
         }
         self.log_messages();
@@ -6232,7 +6232,7 @@ impl Host {
                 }
             }
             if last > 0 {
-                FINISHED.store(last, Ordering::Release);
+                FINISHED.fetch_max(last, Ordering::AcqRel);
                 bury(last);
             }
             line().landed.extend(landed);
@@ -6572,7 +6572,7 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        FINISHED.store(this_submission, Ordering::Release);
+        FINISHED.fetch_max(this_submission, Ordering::AcqRel);
         bury(this_submission);
         let gpu = prepared.elapsed();
         submission_us(0, (prepared - started).as_micros() as u64);
