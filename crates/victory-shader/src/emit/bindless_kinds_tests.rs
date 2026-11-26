@@ -140,12 +140,14 @@ impl Kind {
     }
 
     /// The bytes per element the host's stride table (`SLOT_STRIDES`) has
-    /// for this kind's placed slots: a buffer view's stride, 0 for a
-    /// constant buffer or a texture.
+    /// for this kind's placed slots: a buffer view's stride, the constant
+    /// buffer mark for a constant buffer (`SLOT_STRIDE_CONSTANT`, with
+    /// `constant_marks`), 0 for a texture.
     fn stride(self) -> u32 {
         match self {
             Kind::RawUav | Kind::RawSrv | Kind::StructuredSrv | Kind::ScalarRawSrv => 4,
             Kind::TypedSrv => 16,
+            Kind::Cbv if super::shader::constant_marks() => super::shader::SLOT_STRIDE_CONSTANT,
             _ => 0,
         }
     }
@@ -277,6 +279,7 @@ fn lower_cs(words: &[u32]) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
