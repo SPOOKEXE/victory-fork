@@ -29,7 +29,9 @@ struct Fence {
     value: AtomicU64,
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    /// Events set when the fence reaches a value: the value, the event, and
+    /// for the frame graph the thread that asked and when (`crate::trace`).
+    waiters: Mutex<Vec<(u64, usize, u32, u64)>>,
     /// For [`pace`]: when each wait above was asked for.
     #[cfg(all(windows, feature = "diagnostics"))]
     asked: Mutex<Vec<pace::Asked>>,
@@ -115,7 +117,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    let (tid, at) = crate::trace::asked();
+    waiters.push((value, event as usize, tid, at));
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -125,10 +128,12 @@ pub(crate) fn set(this: This, value: u64) {
     fence.value.store(value, Ordering::Release);
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::reached(this, &fence.asked, value);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, tid, at)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            // (the time the asking thread may have waited for it, on its track)
+            crate::trace::waited("a fence it asked for, until reached", tid, at);
         }
         !reached
     });

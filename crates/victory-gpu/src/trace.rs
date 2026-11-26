@@ -115,6 +115,24 @@ impl Drop for Span {
     }
 }
 
+/// This thread's track and the moment, if spans are timed (0, 0 if not):
+/// for [`waited`].
+pub(crate) fn asked() -> (u32, u64) {
+    if on() { (thread(), crate::clock::now_ns()) } else { (0, 0) }
+}
+
+/// A span `name` on track `tid` from `at` ([`asked`]) to now, recorded by
+/// another thread: what a thread waited for until something else came.
+pub(crate) fn waited(name: &'static str, tid: u32, at: u64) {
+    if at == 0 || !on() {
+        return;
+    }
+    let len = crate::clock::now_ns().saturating_sub(at);
+    #[cfg(windows)]
+    crate::overlay::span(name, tid, at, len);
+    push(Event::Span(name, tid, at, len, 0));
+}
+
 /// Times the caller's scope as `name` on this thread's track.
 pub(crate) fn span(name: &'static str) -> Option<Span> {
     on().then(|| Span { name, at: crate::clock::now_ns(), arg: 0 })
