@@ -170,6 +170,10 @@ default VICTORY_HEAP_LOCKS 1
 # parent's default): spread, the first world scene stalled the card 2 to 5
 # times for over 2 s (runs Y and Y2); off, none (run Y3).
 default VICTORY_DISPATCH_SPREAD 0
+# Flights get more room before they are settled (the parent's
+# VICTORY_SETTLE_ROOM: lists in the air x2, changed runs merged x8): the
+# café's 35 ms waits a frame for a merge that gave up went (run Z2).
+default VICTORY_SETTLE_ROOM 1
 # Fills of upload memory wait for flights only where shaders have written
 # this run (one wait a frame in the café instead of two).
 default VICTORY_FILL_WAIT learn

@@ -3937,8 +3937,6 @@ impl Shadow {
         self.card.is_some()
     }
 
-    /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
-    /// card's side before the next submission.
     /// [`Shadow::card_changed`] for each of `runs` (offset from `at`,
     /// bytes), in order, under one taking of the lock.
     fn card_changed_runs(&self, at: usize, runs: &[(usize, usize)]) {
@@ -3966,6 +3964,8 @@ impl Shadow {
         }
     }
 
+    /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
+    /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
         let Some(card) = &self.card else {
             return;

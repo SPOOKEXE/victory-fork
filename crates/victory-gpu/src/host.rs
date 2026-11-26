@@ -2537,6 +2537,9 @@ fn card_fills() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILLS").is_none_or(|v| v != "0"))
 }
 
+/// Title buffer copies done on the card since the start ([`HostList::card_copy`]).
+pub(crate) static CARD_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Constant buffers copied on the card since the start ([`HostList::card_fill`]).
 pub(crate) static CARD_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -3872,6 +3875,16 @@ mod fill_ahead {
     /// What [`WRITTEN`] is kept by.
     const LEARNED: usize = PIECE;
 
+    /// `[at, at + len)` is written on the card from now on (a copy of ours
+    /// there, [`super::HostList::card_copy`]): noted as shaders' changes are.
+    pub(crate) fn note_written(at: usize, len: usize) {
+        if mode() != Mode::Learn || len == 0 {
+            return;
+        }
+        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        written.get_or_insert_with(HashSet::new).extend(at / LEARNED..=(at + len - 1) / LEARNED);
+    }
+
     /// Whether `len` bytes at `src` lie in a piece shaders have changed
     /// this run ([`Mode::Learn`] only).
     pub(crate) fn shaders_wrote(src: usize, len: usize) -> bool {
@@ -4006,13 +4019,14 @@ mod fill_ahead {
             "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT={}): {:.1} per \
              frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
              bytes a flight then changed, since the start: {}{}; {kept} fills kept to check; {learned} pieces of 64 KiB shaders \
-             changed, where fills wait; {} constant buffers copied on the card instead, since the start",
+             changed, where fills wait; {} constant buffers and {} title buffer copies done on the card instead, since the start",
             if mode() == Mode::Learn { "learn" } else { "0" },
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
             if WAIT.load(Relaxed) { " (fills wait again)" } else { "" },
-            super::CARD_FILLS.load(Relaxed)
+            super::CARD_FILLS.load(Relaxed),
+            super::CARD_COPIES.load(Relaxed)
         );
     }
 
@@ -8678,6 +8692,62 @@ impl HostList {
         (*used, *read) = (at + len, true);
         CARD_FILLS.fetch_add(1, Ordering::Relaxed);
         Some(gpu)
+    }
+
+    /// A title buffer copy of `len` bytes from `src` to `dst` (title
+    /// addresses) whose source lies where shaders write ([`shaders_wrote`]),
+    /// recorded as a copy on the card here, in the list, in order: no wait
+    /// for flights at submission, as [`HostList::card_fill`] does for
+    /// constant buffers. True if recorded; false leaves it to the CPU's
+    /// copy at submission (`defer_copy`).
+    ///
+    /// Why: in the café one such copy a frame (2 KiB, the same block each
+    /// time) made the submitting thread wait for every flight in the air,
+    /// 21 to 32 ms a frame, and the wait was needed: the source had other
+    /// bytes after it 487 times of 526 (fill_check).
+    ///
+    /// The destination's range is then the card's to write: declared as
+    /// shaders' writes ([`crate::shadow::Shadow::gpu_writes`]), so that no
+    /// refresh copies the title's old bytes over it and the copy-back puts
+    /// the new ones into title memory when the submission has run; and
+    /// noted as shader-written ([`fill_ahead::note_written`]), so that
+    /// constant buffers read from it are copied on the card too.
+    pub(crate) fn card_copy(&self, dst: usize, src: usize, len: usize) -> bool {
+        const COPY_DEST: i32 = 0x400;
+        const COPY_SOURCE: i32 = 0x800;
+        if !card_fills() || len == 0 || !shaders_wrote(src, len) {
+            return false;
+        }
+        let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len as u64), crate::shadow::find(dst as u64, len as u64)) else {
+            return false;
+        };
+        // Both whole inside their copies, and the destination's copy in the
+        // card's memory (one the copy-back brings home).
+        if !to.carded() || from.left(src as u64) < len as u64 || to.left(dst as u64) < len as u64 || std::sync::Arc::ptr_eq(&from, &to) {
+            return false;
+        }
+        // The source's CPU-side changes first, as for any read of it.
+        from.refresh(self, src as u64, len as u64);
+        to.gpu_writes(self, dst as u64, len as u64);
+        fill_ahead::note_written(dst, len);
+        // SAFETY: live buffers; an open list. Each copy moves from the
+        // common state (every write before it in the queue made visible)
+        // to a copy's source or destination and back.
+        unsafe {
+            let state = |s: i32| D3D12_RESOURCE_STATES(s);
+            let at = |shadow: &crate::shadow::Shadow, address: usize| shadow.gpu(address as u64) - shadow.buffer.GetGPUVirtualAddress();
+            self.list.ResourceBarrier(&[
+                transition(&from.buffer, state(0), state(COPY_SOURCE)),
+                transition(&to.buffer, state(0), state(COPY_DEST)),
+            ]);
+            self.list.CopyBufferRegion(&to.buffer, at(&to, dst), &from.buffer, at(&from, src), len as u64);
+            self.list.ResourceBarrier(&[
+                transition(&from.buffer, state(COPY_SOURCE), state(0)),
+                transition(&to.buffer, state(COPY_DEST), state(0)),
+            ]);
+        }
+        CARD_COPIES.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
