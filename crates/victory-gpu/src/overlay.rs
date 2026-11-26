@@ -1,4 +1,4 @@
-//! The in-game overlay (F9): what a frame's time goes to, span by span,
+//! The in-game overlay (F9; F10 the card, F8 memory, F7 a time line): what a frame's time goes to, span by span,
 //! drawn by us on the processor and copied onto the back buffer just
 //! before the present. No UI library: labelled bars in a 5x7 font with a
 //! dark outline and no panel behind them (only the lit pixels are copied,
@@ -31,7 +31,8 @@ const DEPTHS: [usize; 4] = [1, 3, 6, usize::MAX];
 
 static SHOWN: AtomicBool = AtomicBool::new(false);
 /// Which view is up: 0 the processor's spans (F9), 1 the card's time by
-/// pipeline (F10), 2 where the memory is (F8).
+/// pipeline (F10), 2 where the memory is (F8), 3 one frame's spans in order
+/// on a time line, the processor's threads and the card's lists (F7).
 static VIEW: AtomicU32 = AtomicU32::new(0);
 /// The first row shown, and the depth.
 static SCROLL: AtomicU32 = AtomicU32::new(0);
@@ -62,8 +63,35 @@ struct State {
     summed: u32,
     since_ns: u64,
     vram: (u64, u64),
-    /// F9, Up, Down, Left, Right, F10, F8 as last seen.
-    keys: [bool; 7],
+    /// F9, Up, Down, Left, Right, F10, F8, F7 as last seen.
+    keys: [bool; 8],
+    /// The time line (F7), kept only while it is up: spans of the last
+    /// [`KEEP_NS`] (start ns, length ns, thread group, name), the presents'
+    /// times, and the frame laid out at the last half second.
+    timeline: std::collections::VecDeque<(u64, u64, u8, &'static str)>,
+    presents: std::collections::VecDeque<u64>,
+    laid: Option<Laid>,
+}
+
+/// How long the time line keeps spans: the card's times arrive about a
+/// second and a half after the frame they belong to.
+const KEEP_NS: u64 = 4_000_000_000;
+/// The frame shown on the time line is the last one that ended this long ago.
+const SHOW_BEHIND_NS: u64 = 2_000_000_000;
+
+/// A frame laid out for the time line: its length, and its spans (start and
+/// length in ms from the frame's start, thread group, depth inside that
+/// group's other spans, name).
+struct Laid {
+    ms: f64,
+    spans: Vec<(f64, f64, u8, u8, &'static str)>,
+}
+
+/// Thread groups of the time line, in the order of its rows.
+const GROUPS: [&str; 6] = ["title render thread", "title-main", "victory-submit", "victory-wide", "victory-relay", "card"];
+
+fn group_index(group: &str) -> u8 {
+    GROUPS.iter().position(|g| *g == group).unwrap_or(GROUPS.len()) as u8
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -116,6 +144,27 @@ fn pipeline_text(name: &str) -> String {
     text.to_uppercase()
 }
 
+/// Whether the time line (F7) is up: the card meter then times every
+/// pipeline, to show them inside the card's lists.
+pub(crate) fn timeline_shown() -> bool {
+    shown() && VIEW.load(Relaxed) == 3
+}
+
+/// `name` as a string that lives as long as the process: the card's pipelines
+/// on the time line, named by the meter's text (about as many as there are
+/// pipelines, each kept once).
+pub(crate) fn interned(name: &str) -> &'static str {
+    static NAMES: Mutex<Option<std::collections::HashSet<&'static str>>> = Mutex::new(None);
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let names = names.get_or_insert_with(Default::default);
+    if let Some(&n) = names.get(name) {
+        return n;
+    }
+    let n: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(n);
+    n
+}
+
 /// Whether the card's view (F10) is up: the card meter then times every
 /// pipeline (`crate::cardmeter::pipelines`).
 pub(crate) fn gpu_shown() -> bool {
@@ -143,20 +192,20 @@ pub(crate) fn thread_name(tid: u32, name: &str) {
 /// A span ended: `ns` long, on thread `tid` (`crate::trace::CARD_TRACK`
 /// for the card's). Gathered per thread and handed over 128 at a time:
 /// thousands a frame from seven threads into one lock was a wait of its own.
-pub(crate) fn span(name: &'static str, tid: u32, ns: u64) {
+pub(crate) fn span(name: &'static str, tid: u32, start: u64, ns: u64) {
     thread_local! {
-        static HERE: std::cell::RefCell<Vec<(&'static str, u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+        static HERE: std::cell::RefCell<Vec<(&'static str, u32, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     HERE.with(|here| {
         let mut here = here.borrow_mut();
-        here.push((name, tid, ns));
+        here.push((name, tid, start, ns));
         if here.len() >= 128 || tid == crate::trace::CARD_TRACK {
             hand_over(&mut here);
         }
     });
 }
 
-fn hand_over(spans: &mut Vec<(&'static str, u32, u64)>) {
+fn hand_over(spans: &mut Vec<(&'static str, u32, u64, u64)>) {
     let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     let group = |tid: u32| {
         if tid == crate::trace::CARD_TRACK {
@@ -167,8 +216,13 @@ fn hand_over(spans: &mut Vec<(&'static str, u32, u64)>) {
     };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = state.as_mut() {
-        for (name, tid, ns) in spans.drain(..) {
-            let e = s.spans.entry((group(tid), name)).or_insert((0, 0));
+        let timeline = VIEW.load(Relaxed) == 3;
+        for (name, tid, start, ns) in spans.drain(..) {
+            let g = group(tid);
+            if timeline {
+                s.timeline.push_back((start, ns, group_index(&g), name));
+            }
+            let e = s.spans.entry((g, name)).or_insert((0, 0));
             e.0 += ns;
             e.1 += 1;
         }
@@ -197,17 +251,21 @@ pub(crate) fn frame() {
         summed: 0,
         since_ns: now,
         vram: (0, 0),
-        keys: [false; 7],
+        keys: [false; 8],
+        timeline: Default::default(),
+        presents: Default::default(),
+        laid: None,
     });
     {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         // SAFETY: plain queries.
-        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
+        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
         let pressed = |k: usize| down[k] && !s.keys[k];
         let front = focused();
-        // F9 the processor's view, F10 the card's, F8 the memory's: the
-        // same key again hides it, another key switches to its view.
-        for (key, view) in [(0, 0), (5, 1), (6, 2)] {
+        // F9 the processor's view, F10 the card's, F8 the memory's, F7 the
+        // time line: the same key again hides it, another key switches to
+        // its view.
+        for (key, view) in [(0, 0), (5, 1), (6, 2), (7, 3)] {
             if pressed(key) && front {
                 if shown() && VIEW.load(Relaxed) == view {
                     SHOWN.store(false, Relaxed);
@@ -241,6 +299,19 @@ pub(crate) fn frame() {
     }
     s.frames.push_back((now - s.last_ns) as f32 / 1e6);
     s.last_ns = now;
+    if VIEW.load(Relaxed) == 3 && shown() {
+        s.presents.push_back(now);
+        while s.presents.front().is_some_and(|&p| p + KEEP_NS < now) {
+            s.presents.pop_front();
+        }
+        while s.timeline.front().is_some_and(|&(start, ..)| start + KEEP_NS < now) {
+            s.timeline.pop_front();
+        }
+    } else if !s.timeline.is_empty() || !s.presents.is_empty() {
+        s.timeline.clear();
+        s.presents.clear();
+        s.laid = None;
+    }
     let totals = crate::framelog::totals();
     for (i, (now, was)) in totals.iter().zip(&s.totals).enumerate() {
         s.sums[i] += now.saturating_sub(*was);
@@ -273,6 +344,9 @@ pub(crate) fn frame() {
         s.gpu_rows.sort_by(|a, b| b.1.total_cmp(&a.1));
         s.summed = 0;
         s.since_ns = now;
+        if VIEW.load(Relaxed) == 3 && shown() {
+            s.laid = lay_out(&s.timeline, &s.presents, now);
+        }
         #[cfg(feature = "diagnostics")]
         if shown() && VIEW.load(Relaxed) == 2 && now - s.memory_at >= 2_000_000_000 {
             s.memory_at = now;
@@ -284,6 +358,109 @@ pub(crate) fn frame() {
             s.vram = (used >> 20, budget >> 20);
         }
     }
+}
+
+/// The last frame that ended [`SHOW_BEHIND_NS`] ago or earlier, laid out for
+/// the time line: the spans that overlap it, cut to it, each with its depth
+/// among the spans of its thread group that hold it (a span inside a longer
+/// one of the same thread goes a row lower).
+fn lay_out(
+    timeline: &std::collections::VecDeque<(u64, u64, u8, &'static str)>,
+    presents: &std::collections::VecDeque<u64>,
+    now: u64,
+) -> Option<Laid> {
+    let pairs: Vec<(u64, u64)> = presents.iter().zip(presents.iter().skip(1)).map(|(&a, &b)| (a, b)).collect();
+    let &(from, to) = pairs.iter().rev().find(|(_, end)| end + SHOW_BEHIND_NS <= now)?;
+    let mut spans: Vec<(u64, u64, u8, &'static str)> =
+        timeline.iter().copied().filter(|&(start, len, ..)| start < to && start + len > from).collect();
+    // Longer first among equal starts: a holder comes before what it holds.
+    spans.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)).then(b.1.cmp(&a.1)));
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let mut out = Vec::with_capacity(spans.len());
+    let mut open: Vec<u64> = Vec::new();
+    let mut group = u8::MAX;
+    for (start, len, g, name) in spans {
+        if g != group {
+            (group, open) = (g, Vec::new());
+        }
+        while open.last().is_some_and(|&end| end <= start) {
+            open.pop();
+        }
+        let depth = open.len().min(255) as u8;
+        open.push(start + len);
+        let (a, b) = (start.max(from), (start + len).min(to));
+        out.push((ms(a - from), ms(b - a), g, depth, name));
+    }
+    Some(Laid { ms: ms(to - from), spans: out })
+}
+
+/// A colour for span `name`, the same every frame.
+fn colour_of(name: &str) -> u32 {
+    const PALETTE: [u32; 8] = [0xffe0_6060, 0xffe0_a040, 0xffd0_d050, 0xff60_c070, 0xff50_b0e0, 0xff80_80f0, 0xffc0_70e0, 0xffa0_a0a0];
+    let h = name.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ u32::from(b));
+    PALETTE[(h % PALETTE.len() as u32) as usize]
+}
+
+/// The time line (F7): a row per thread group and depth with the frame's spans
+/// as bars on one time axis, the card's lists last; under it the spans of
+/// the top two depths in the order they started, with their start, length
+/// and share of the frame.
+fn draw_timeline(px: &mut [u32], s: &State, lines: &mut Vec<(String, Option<(f64, f64, f64)>)>) -> u32 {
+    const HEAD: u32 = 0xff9c_d0ff;
+    const TEXT: u32 = 0xfff0_f0f0;
+    text_at(px, 2, 22, "TIME LINE OF ONE FRAME, 2 S AGO (F9: TOTALS)", HEAD);
+    let Some(laid) = &s.laid else {
+        text_at(px, 2, 34, "(THE CARD'S TIMES ARRIVE A SECOND AND A HALF LATE)", TEXT);
+        return 44;
+    };
+    let (x0, w) = (92u32, WIDTH - 96);
+    let at = |ms: f64| x0 + ((ms / laid.ms.max(0.001)) * f64::from(w)) as u32;
+    // ticks every 10 ms
+    let mut y = 32;
+    let mut t = 0.0;
+    while t <= laid.ms {
+        put(px, at(t), y, HEAD);
+        put(px, at(t), y + 1, HEAD);
+        t += 10.0;
+    }
+    text_at(px, 2, y, &format!("{:.0} MS", laid.ms), HEAD);
+    y += 4;
+    const BAR: u32 = 6;
+    const DEPTHS_SHOWN: u8 = 3;
+    for (g, name) in GROUPS.iter().enumerate() {
+        let rows = laid.spans.iter().filter(|sp| sp.2 as usize == g).map(|sp| sp.3 + 1).max().unwrap_or(0).min(DEPTHS_SHOWN);
+        if rows == 0 {
+            continue;
+        }
+        let short: String = name.trim_start_matches("title ").trim_start_matches("victory-").chars().take(14).collect();
+        text_at(px, 2, y, &short, HEAD);
+        for sp in laid.spans.iter().filter(|sp| sp.2 as usize == g && sp.3 < rows) {
+            let (a, b) = (at(sp.0), at(sp.0 + sp.1).max(at(sp.0) + 1));
+            let top = y + u32::from(sp.3) * (BAR + 1);
+            let c = colour_of(sp.4);
+            for yy in top..top + BAR {
+                for x in a..b.min(x0 + w) {
+                    put(px, x, yy, c);
+                }
+            }
+        }
+        y += u32::from(rows) * (BAR + 1) + 3;
+    }
+    // In order: the spans of the top two depths that take a hundredth of the frame
+    let mut listed: Vec<&(f64, f64, u8, u8, &'static str)> =
+        laid.spans.iter().filter(|sp| sp.3 < 2 && sp.1 >= laid.ms / 100.0).collect();
+    listed.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for sp in listed {
+        let group: String = GROUPS.get(sp.2 as usize).copied().unwrap_or("other")
+            .trim_start_matches("title ").trim_start_matches("victory-").chars().take(6).collect();
+        let indent = if sp.3 == 1 { "  " } else { "" };
+        let what = if sp.4.starts_with('[') { pipeline_text(sp.4) } else { sp.4.to_owned() };
+        lines.push((
+            format!("{:6.1} {indent}{} {}", sp.0, group, what).to_uppercase(),
+            Some((sp.1, sp.1 / laid.ms.max(0.001) * 100.0, laid.ms)),
+        ));
+    }
+    y + 2
 }
 
 /// Whether the title should not see virtual key `vk`: an arrow key while
@@ -337,7 +514,10 @@ pub(crate) fn draw() -> Vec<u32> {
     let depth = DEPTHS[DEPTH.load(Relaxed) as usize];
     let mut lines: Vec<(String, Option<(f64, f64, f64)>)> = Vec::new();
     let view = VIEW.load(Relaxed);
-    if view == 2 {
+    let mut top = 32;
+    if view == 3 {
+        top = draw_timeline(&mut px, s, &mut lines);
+    } else if view == 2 {
         // Where the memory is: each row a bar against the card's budget
         // (card rows) or the process's private bytes (the others).
         text_at(&mut px, 2, 22, "MEMORY (F9: PROCESSOR, F10: CARD)                   MB     N", HEAD);
@@ -384,17 +564,20 @@ pub(crate) fn draw() -> Vec<u32> {
             }
         }
     }
-    let first = (SCROLL.load(Relaxed) as usize).min(lines.len().saturating_sub(ROWS));
+    // (the time line's list has the rows left under its bars)
+    let room = if view == 3 { ((HEIGHT - 12).saturating_sub(top) / ROW) as usize } else { ROWS };
+    let first = (SCROLL.load(Relaxed) as usize).min(lines.len().saturating_sub(room));
     SCROLL.store(first as u32, Relaxed);
     // (the card's view: wider names, the shaders' own)
-    let names = if view == 1 { 228 } else { 150 };
+    let names = if view == 1 || view == 3 { 228 } else { 150 };
     let (bar_x, bar_w) = (names, WIDTH - names - 104);
-    let mut y = 32;
-    for (label, value) in lines.iter().skip(first).take(ROWS) {
+    let mut y = top;
+    for (label, value) in lines.iter().skip(first).take(room) {
         match value {
             None => text_at(&mut px, 2, y, label, HEAD),
             Some((v, count, full)) => {
-                text_at(&mut px, 8, y, &label.chars().take(23).collect::<String>(), TEXT);
+                let chars = if view == 3 { 36 } else { 23 };
+                text_at(&mut px, 8, y, &label.chars().take(chars).collect::<String>(), TEXT);
                 let share = v / full.max(1.0);
                 let len = (share.min(1.0) * f64::from(bar_w)) as u32;
                 let colour = match share {
@@ -407,7 +590,12 @@ pub(crate) fn draw() -> Vec<u32> {
                         put(&mut px, x, yy, colour);
                     }
                 }
-                let numbers = if view == 2 { format!("{v:7.0}{count:7.0}") } else { format!("{v:6.1}{count:6.1}") };
+                let numbers = match view {
+                    2 => format!("{v:7.0}{count:7.0}"),
+                    // (the time line: the span's length and its share of the frame, %)
+                    3 => format!("{v:6.1}{count:5.0}%"),
+                    _ => format!("{v:6.1}{count:6.1}"),
+                };
                 text_at(&mut px, bar_x + bar_w + 4, y, &numbers, TEXT);
             }
         }
@@ -417,7 +605,7 @@ pub(crate) fn draw() -> Vec<u32> {
         &mut px,
         2,
         y + 2,
-        &format!("ROWS {}-{} OF {}  UP/DOWN SCROLL  LEFT/RIGHT DEPTH", first + 1, (first + ROWS).min(lines.len()), lines.len()),
+        &format!("ROWS {}-{} OF {}  UP/DOWN SCROLL  LEFT/RIGHT DEPTH", first + 1, (first + room).min(lines.len()), lines.len()),
         HEAD,
     );
     outline(&mut px);
@@ -568,7 +756,7 @@ mod tests {
     #[test]
     fn the_overlay_draws_lit_runs_only() {
         super::frame();
-        super::span("submit", 1, 2_000_000);
+        super::span("submit", 1, 0, 2_000_000);
         super::frame();
         let px = super::draw();
         assert_eq!(px.len(), (super::WIDTH * super::HEIGHT) as usize);
@@ -579,5 +767,36 @@ mod tests {
         for c in "0123456789FPSMS".chars() {
             assert!(super::glyph(c).iter().any(|&r| r != 0), "{c}");
         }
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    #[test]
+    fn the_time_line_shows_the_frame_two_seconds_back_with_nested_spans_a_row_lower() {
+        const MS: u64 = 1_000_000;
+        let now = 10_000 * MS;
+        // presents at 7,900, 8,000 and 8,100 ms: the frame shown is 7,900..8,000 (the
+        // last that ended two seconds ago); 8,000..8,100 is too recent
+        let presents = [7_900 * MS, 8_000 * MS, 8_100 * MS].into_iter().collect();
+        let timeline = [
+            // submit 7,910..7,960 with copies inside it, on group 2
+            (7_910 * MS, 50 * MS, 2, "submit"),
+            (7_920 * MS, 10 * MS, 2, "copies"),
+            // a card list across the frame's start: cut to it
+            (7_890 * MS, 30 * MS, 5, "list"),
+            // after the frame: left out
+            (8_050 * MS, 5 * MS, 2, "submit"),
+        ]
+        .into_iter()
+        .collect();
+        let laid = super::lay_out(&timeline, &presents, now).expect("a frame");
+        assert_eq!(laid.ms, 100.0);
+        assert_eq!(laid.spans.len(), 3);
+        let find = |name| laid.spans.iter().find(|s| s.4 == name).copied().unwrap();
+        assert_eq!(find("submit").3, 0);
+        assert_eq!(find("copies").3, 1);
+        assert_eq!((find("copies").0, find("copies").1), (20.0, 10.0));
+        assert_eq!((find("list").0, find("list").1), (0.0, 20.0));
     }
 }

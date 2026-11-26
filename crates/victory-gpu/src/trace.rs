@@ -110,7 +110,7 @@ impl Drop for Span {
         let end = crate::clock::now_ns();
         let tid = thread();
         #[cfg(windows)]
-        crate::overlay::span(self.name, tid, end.saturating_sub(self.at));
+        crate::overlay::span(self.name, tid, self.at, end.saturating_sub(self.at));
         push(Event::Span(self.name, tid, self.at, end.saturating_sub(self.at), self.arg));
     }
 }
@@ -138,7 +138,7 @@ pub(crate) fn count(name: &'static str, value: f64) {
 pub(crate) fn card(name: &'static str, at: u64, len: u64) {
     if on() {
         #[cfg(windows)]
-        crate::overlay::span(name, CARD_TRACK, len);
+        crate::overlay::span(name, CARD_TRACK, at, len);
         push(Event::Card(name, at, len));
     }
 }

@@ -150,6 +150,7 @@ pub(crate) fn label(hash: &str) -> Option<String> {
 }
 
 /// `text` with the name of every shader hash in it ([`label`]) after the hash.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn labelled(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;

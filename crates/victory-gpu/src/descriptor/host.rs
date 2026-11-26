@@ -4587,8 +4587,10 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         }
         assert_eq!((lowest, highest), (heap.dyn_start, heap.guard_slot() - 1));
         // The guards are the heap's last slots.
-        let kept = heap.kept.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(kept.len(), (heap.guard_slot() as usize) + HEAP_GUARDS.len());
+        // (the slots kept in pieces: slot i in piece i % KEPT_PIECES)
+        let kept: usize = heap.kept.iter().map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).len()).sum();
+        let size = heap.guard_slot() as usize + HEAP_GUARDS.len();
+        assert!(kept >= size && kept < size + KEPT_PIECES as usize, "{kept} kept for {size} slots");
     }
 
     /// The layout a view heap has is the one translated shaders hold as
@@ -4648,10 +4650,8 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let Some(heap) = HostHeap::new(true, 4) else {
             return; // no host GPU
         };
-        assert_eq!(
-            heap.kept.lock().unwrap_or_else(|e| e.into_inner()).len(),
-            2048
-        );
+        let kept: usize = heap.kept.iter().map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).len()).sum();
+        assert_eq!(kept, 2048);
         assert_eq!(heap.count, 4);
     }
 }

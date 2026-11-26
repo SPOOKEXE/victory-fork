@@ -210,9 +210,9 @@ pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
 pub(crate) fn pipelines() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let set = *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1"));
-    // (And while the overlay's card view is up, F10.)
+    // (And while the overlay's card view or time line is up, F10 or F7.)
     #[cfg(windows)]
-    if !set && on() && crate::overlay::gpu_shown() {
+    if !set && on() && (crate::overlay::gpu_shown() || crate::overlay::timeline_shown()) {
         return true;
     }
     set
@@ -382,6 +382,10 @@ pub(crate) fn collect() {
                 Kind::Sync => "our send-and-hash list",
                 Kind::Check => "our compare list",
                 Kind::Lists => "list",
+                // (by its shaders' names on the overlay's time line)
+                #[cfg(windows)]
+                Kind::Pipeline => m.names.get(&pair).map_or("pipeline", |n| crate::overlay::interned(n)),
+                #[cfg(not(windows))]
                 Kind::Pipeline => "pipeline",
             };
             crate::trace::card(name, ours.saturating_sub(back), us * 1_000);
