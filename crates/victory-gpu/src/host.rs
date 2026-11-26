@@ -1381,6 +1381,25 @@ fn wait_for_card(event: HANDLE, what: &str) {
     let _ = what;
 }
 
+/// The commands and pipelines of the last 4,096 recordings, kept at their
+/// list's reset with breadcrumbs on: a hang's recording may have been reset
+/// (its texts cleared) by the time the report looks.
+#[cfg(feature = "diagnostics")]
+static CRUMB_KEPT: Mutex<std::collections::VecDeque<(u32, Vec<Note>, std::collections::BTreeSet<String>)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(feature = "diagnostics")]
+fn crumbs_keep(id: u32, notes: Vec<Note>, pipelines: std::collections::BTreeSet<String>) {
+    if id == 0 || notes.is_empty() {
+        return;
+    }
+    let mut kept = CRUMB_KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.len() >= 4096 {
+        kept.pop_front();
+    }
+    kept.push_back((id, notes, pipelines));
+}
+
 /// What the breadcrumbs say after `what` did not finish: the raw words, the
 /// list their mark names (found by its mark among the host lists with
 /// breadcrumbs on), its pipelines, and with the commands noted
@@ -1396,6 +1415,16 @@ fn crumbs_report(what: &str) {
          (0xfff1: our send-and-hash list, 0xfff2: our compare list, low 0xfffe: a list just started); \
          recordings {begun_id} begun, {done_id} done"
     );
+    // A recording reset since: its texts were kept.
+    {
+        let kept = CRUMB_KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, notes, pipelines)) = kept.iter().rev().find(|k| k.0 == begun_id) {
+            tracing::error!("breadcrumbs: recording {begun_id} (reset since; kept), its pipelines: {pipelines:?}");
+            let done = if done_id == begun_id { done & 0xffff } else { 0 };
+            crumbs_print(notes, done);
+            return;
+        }
+    }
     let lists = CRUMB_LISTS.lock().unwrap_or_else(|e| e.into_inner());
     // (A list in the table is alive: its drop takes it out under this lock.)
     let Some(list) = lists.as_ref().and_then(|m| m.get(&begun_id).copied()).map(|at| unsafe { &*(at as *const HostList) })
@@ -1411,8 +1440,13 @@ fn crumbs_report(what: &str) {
         tracing::error!("breadcrumbs: the list had begun and none of its noted commands had");
         return;
     }
-    // The card stopped at the first command not done (the begun marks run
-    // ahead: they are written as commands start, without waiting).
+    crumbs_print(&notes, done);
+}
+
+/// The commands from the first one not done on (the begun marks run ahead:
+/// they are written as commands start, without waiting).
+#[cfg(feature = "diagnostics")]
+fn crumbs_print(notes: &[Note], done: u32) {
     tracing::error!("breadcrumbs: {} commands noted in the list", notes.len());
     let from = done.saturating_sub(2) as usize;
     for k in from..(from + 8).min(notes.len()) {
@@ -7107,7 +7141,9 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // (Kept a moment for the breadcrumbs' record of the recording.)
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+        let pipelines_before = std::mem::take(&mut *self.pipelines.lock().unwrap_or_else(|e| e.into_inner()));
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
             let Gather { closed, written, sets, spare, .. } = &mut *gather;
@@ -7120,7 +7156,12 @@ impl HostList {
             }
         }
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let notes = std::mem::take(&mut *self.notes.lock().unwrap_or_else(|e| e.into_inner()));
+            if crumbs_on() {
+                crumbs_keep(crumb_list(self), notes, pipelines_before);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         {
             *self.shot_block.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, 0);
