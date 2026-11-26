@@ -690,6 +690,43 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
         }
     }
+    // Scalars read only as descriptors (an image's or buffer's resource or sampler words).
+    // A region that builds one the code after the join reads (the compiler sinks the
+    // constant words of a sampler into the first branch that uses it): with the branch taken
+    // the console would read whatever the registers held before, no descriptor, so the
+    // region's words are the ones meant.
+    let mut other_use: std::collections::HashSet<Value> = Default::default();
+    let mut descriptor_use: std::collections::HashSet<Value> = Default::default();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            let words: Vec<u8> = match &inst.fields {
+                crate::gfx10::Fields::Image { rsrc, sampler, .. } => [Some(rsrc), sampler.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|o| match *o {
+                        crate::gfx10::Operand::Scalar { code, dwords } => Some(code..code + dwords),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect(),
+                crate::gfx10::Fields::Buffer { rsrc: crate::gfx10::Operand::Scalar { code, dwords }, .. } => {
+                    (*code..*code + *dwords).collect()
+                }
+                _ => Vec::new(),
+            };
+            for &(reg, v) in &inst.reads {
+                if matches!(reg, Reg::S(c) if words.contains(&c)) {
+                    descriptor_use.insert(v);
+                } else {
+                    other_use.insert(v);
+                }
+            }
+        }
+        for phi in &block.phis {
+            other_use.extend(phi.args.iter().copied());
+        }
+    }
+    let only_descriptor = |v: Value| deep && descriptor_use.contains(&v) && !other_use.contains(&v);
     let root = |mut v: Value| {
         while deep && let Some(&c) = copy.get(&v) {
             v = c;
@@ -727,8 +764,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 Reg::Scc => true,
                 Reg::V(_) => false,
             };
-            // (a join nothing reads shows no one the difference)
-            if !scalar || deep && !live.contains(&phi.value) {
+            // (a join nothing reads shows no one the difference; nor one read only as a
+            // descriptor, `only_descriptor`)
+            if !scalar || deep && !live.contains(&phi.value) || only_descriptor(phi.value) {
                 continue;
             }
             let before: Vec<Value> =

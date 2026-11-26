@@ -458,16 +458,17 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
+        // Before the approximate forms only when asked for (`VICTORY_WAVE_WIDE=1`, or the
+        // program on `VICTORY_WAVE_WIDE_ONLY`'s list): runs 121-124 lost the card with it in
+        // a submission of two programs that had just moved to it (`ptfx_CS_lightAtlas_Sprite`
+        // and `_Trail`), when its halves met at group barriers.
         let wide_on = wave_wide_here();
-        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
-        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
-        // the programs the approximate forms already take keep their barrier-free form.
-        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
+        // By default (or `VICTORY_WAVE_WIDE=last`) the same form, but only for programs that
+        // every other form below leaves at 64 lanes (on a 32-lane host those are refused
+        // outright), so the programs the approximate forms already take keep their
+        // barrier-free form. Its halves meet on their own then ([`lower::pair_meet_on`]):
+        // halves that meet unevenly cannot hang the card. `VICTORY_WAVE_WIDE=0`: never.
+        let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -605,9 +606,10 @@ pub fn emit(
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. In a thread group of several console waves
+/// those decide apart, so a group barrier inside such a branch would wait for threads that
+/// never come: there the two halves of each console wave meet on their own
+/// ([`lower::pair_meet_on`]).
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -621,7 +623,11 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // whole console waves, whose halves meet on their own when there are several
+        // (`lower::pair_meet_on`)
+        crate::native::StageIo::Cs(cs)
+            if lower::with_wide_meetings(|| lower::pair_meet_on(cs.threads.iter().product::<u32>()))
+                || cs.threads.iter().product::<u32>() == 64 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -636,7 +642,7 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = lower::with_wide_meetings(|| emit_program(c, native, p, &st, &io, &res));
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)

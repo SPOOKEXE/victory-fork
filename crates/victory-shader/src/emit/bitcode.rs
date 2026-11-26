@@ -226,6 +226,9 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Blocks cut in two by [`Module::split`]: the block that now holds the rest of each
+    /// (code added later, the terminator, the edges out).
+    rest: HashMap<usize, usize>,
 }
 
 impl Module {
@@ -412,8 +415,41 @@ impl Module {
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
+        let block = self.end_of(block);
         self.blocks[block].body.push(i);
         V::Inst(i)
+    }
+
+    /// The block that holds the end of `block`: itself, or where [`Module::split`] moved it.
+    pub fn end_of(&self, mut block: usize) -> usize {
+        while let Some(&b) = self.rest.get(&block) {
+            block = b;
+        }
+        block
+    }
+
+    /// Cuts the end of `block` (which may already be closed) off into a new block: `block`
+    /// then jumps to `into` (a new, empty block the caller fills and closes), and from here
+    /// on code added to `block`, its terminator and the edges out of it belong to the
+    /// returned block, which `into`'s code must end by jumping to. For code that needs its
+    /// own blocks (a loop) at the end of a block that later code also adds to.
+    pub fn split(&mut self, block: usize, into: usize) -> usize {
+        let block = self.end_of(block);
+        let rest = self.new_block();
+        self.blocks[rest].term = self.blocks[block].term.take();
+        self.blocks[block].term = Some(Term::Br(into));
+        // phis on the edges out of `block` now come from `rest` (not those of `into`, empty)
+        for inst in &mut self.insts {
+            if let Op::Phi(incoming) = &mut inst.op {
+                for (_, from) in incoming.iter_mut() {
+                    if *from == block {
+                        *from = rest;
+                    }
+                }
+            }
+        }
+        self.rest.insert(block, rest);
+        rest
     }
 
     pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
@@ -494,9 +530,21 @@ impl Module {
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
+        let incoming = incoming.into_iter().map(|(v, b)| (v, self.end_of(b))).collect();
         self.insts[i as usize].op = Op::Phi(incoming);
     }
+    /// [`Module::set_phi`] with the blocks as given: for edges out of the first part of a
+    /// block [`Module::split`] cut.
+    pub fn set_phi_exact(&mut self, phi: V, incoming: Vec<(V, usize)>) {
+        let V::Inst(i) = phi else { panic!() };
+        self.insts[i as usize].op = Op::Phi(incoming);
+    }
+    /// [`Module::terminate`] of the first part of a block [`Module::split`] cut.
+    pub fn terminate_exact(&mut self, block: usize, t: Term) {
+        self.blocks[block].term = Some(t);
+    }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.end_of(block);
         self.blocks[block].term = Some(t);
     }
 
