@@ -212,7 +212,7 @@ pub(crate) fn pipelines() -> bool {
     let set = *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1"));
     // (And while the overlay's card view or time line is up, F10 or F7.)
     #[cfg(windows)]
-    if !set && on() && (crate::overlay::gpu_shown() || crate::overlay::timeline_shown()) {
+    if !set && on() && (crate::overlay::gpu_shown() || crate::overlay::timeline_shown() || crate::overlay::recording()) {
         return true;
     }
     set

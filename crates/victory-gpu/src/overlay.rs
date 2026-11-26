@@ -63,15 +63,39 @@ struct State {
     summed: u32,
     since_ns: u64,
     vram: (u64, u64),
-    /// F9, Up, Down, Left, Right, F10, F8, F7 as last seen.
-    keys: [bool; 8],
+    /// F9, Up, Down, Left, Right, F10, F8, F7, F1 as last seen.
+    keys: [bool; 9],
     /// The time line (F7), kept only while it is up: spans of the last
     /// [`KEEP_NS`] (start ns, length ns, thread group, name), the presents'
     /// times, and the frame laid out at the last half second.
     timeline: std::collections::VecDeque<(u64, u64, u8, &'static str)>,
     presents: std::collections::VecDeque<u64>,
     laid: Option<Laid>,
+    /// A snapshot being recorded (F1, `VICTORY_SNAPSHOT_AT`).
+    snap: Option<Snap>,
 }
+
+/// How long a snapshot records, and how long after that it waits for the
+/// card's times (they arrive about a second and a half late).
+const SNAP_NS: u64 = 2_500_000_000;
+const SNAP_WAIT_NS: u64 = 2_000_000_000;
+
+/// A snapshot (F1): everything the overlay's views show, over [`SNAP_NS`],
+/// written as Markdown to `snapshots/<time>.md` under the run's folder.
+struct Snap {
+    started: u64,
+    totals: Vec<u64>,
+    frames: Vec<f32>,
+    spans: HashMap<(String, &'static str), (u64, u32)>,
+    gpu: HashMap<String, (u64, u32)>,
+}
+
+/// Whether a snapshot is being recorded: spans and the card's pipelines are
+/// timed then, whatever view is up (`crate::trace::on`, `crate::cardmeter`).
+pub(crate) fn recording() -> bool {
+    RECORDING.load(Relaxed)
+}
+static RECORDING: AtomicBool = AtomicBool::new(false);
 
 /// How long the time line keeps spans: the card's times arrive about a
 /// second and a half after the frame they belong to.
@@ -179,6 +203,12 @@ pub(crate) fn gpu_span(name: &str, us: u64) {
         let e = s.gpu.entry(name.to_owned()).or_insert((0, 0));
         e.0 += us;
         e.1 += 1;
+        // (the card's times of the frames recorded arrive within the wait after them)
+        if let Some(snap) = s.snap.as_mut() {
+            let e = snap.gpu.entry(name.to_owned()).or_insert((0, 0));
+            e.0 += us;
+            e.1 += 1;
+        }
     }
 }
 
@@ -216,11 +246,19 @@ fn hand_over(spans: &mut Vec<(&'static str, u32, u64, u64)>) {
     };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = state.as_mut() {
-        let timeline = VIEW.load(Relaxed) == 3;
+        let timeline = VIEW.load(Relaxed) == 3 || s.snap.is_some();
         for (name, tid, start, ns) in spans.drain(..) {
             let g = group(tid);
             if timeline {
                 s.timeline.push_back((start, ns, group_index(&g), name));
+            }
+            if let Some(snap) = s.snap.as_mut()
+                && start >= snap.started
+                && start < snap.started + SNAP_NS
+            {
+                let e = snap.spans.entry((g.clone(), name)).or_insert((0, 0));
+                e.0 += ns;
+                e.1 += 1;
             }
             let e = s.spans.entry((g, name)).or_insert((0, 0));
             e.0 += ns;
@@ -251,15 +289,16 @@ pub(crate) fn frame() {
         summed: 0,
         since_ns: now,
         vram: (0, 0),
-        keys: [false; 8],
+        keys: [false; 9],
         timeline: Default::default(),
         presents: Default::default(),
         laid: None,
+        snap: None,
     });
     {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         // SAFETY: plain queries.
-        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
+        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
         let pressed = |k: usize| down[k] && !s.keys[k];
         let front = focused();
         // F9 the processor's view, F10 the card's, F8 the memory's, F7 the
@@ -292,14 +331,45 @@ pub(crate) fn frame() {
                 DEPTH.store((depth + 1).min(DEPTHS.len() as u32 - 1), Relaxed);
             }
         }
+        // F1: a snapshot of every view to a file (and at the moments
+        // `VICTORY_SNAPSHOT_AT` names, seconds since the start).
+        if (pressed(8) && front || snapshot_due(now)) && s.snap.is_none() {
+            s.snap = Some(Snap {
+                started: now,
+                totals: crate::framelog::totals(),
+                frames: Vec::new(),
+                spans: HashMap::new(),
+                gpu: HashMap::new(),
+            });
+            RECORDING.store(true, Relaxed);
+            tracing::info!("snapshot: recording {} s", SNAP_NS as f64 / 1e9);
+        }
         s.keys = down;
     }
     if s.frames.len() == KEPT {
         s.frames.pop_front();
     }
-    s.frames.push_back((now - s.last_ns) as f32 / 1e6);
+    let frame_ms = (now - s.last_ns) as f32 / 1e6;
+    s.frames.push_back(frame_ms);
     s.last_ns = now;
-    if VIEW.load(Relaxed) == 3 && shown() {
+    if let Some(snap) = s.snap.as_mut() {
+        if now < snap.started + SNAP_NS {
+            snap.frames.push(frame_ms);
+            if now + 30_000_000 >= snap.started + SNAP_NS {
+                snap.totals = crate::framelog::totals()
+                    .iter()
+                    .zip(&snap.totals)
+                    .map(|(now, was)| now.saturating_sub(*was))
+                    .collect();
+            }
+        } else if now >= snap.started + SNAP_NS + SNAP_WAIT_NS {
+            let snap = s.snap.take().expect("checked");
+            RECORDING.store(false, Relaxed);
+            let laid = lay_out(&s.timeline, &s.presents, now);
+            write_snapshot(&snap, laid.as_ref(), s.vram);
+        }
+    }
+    if (VIEW.load(Relaxed) == 3 && shown()) || s.snap.is_some() {
         s.presents.push_back(now);
         while s.presents.front().is_some_and(|&p| p + KEEP_NS < now) {
             s.presents.pop_front();
@@ -477,6 +547,88 @@ fn draw_timeline(px: &mut [u32], s: &State, lines: &mut Vec<(String, Option<(f64
         ));
     }
     y + 2
+}
+
+/// Whether a moment `VICTORY_SNAPSHOT_AT` names (seconds since the start,
+/// comma-separated) has come: each once.
+fn snapshot_due(now: u64) -> bool {
+    static AT: std::sync::OnceLock<Mutex<Vec<f64>>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        let list = std::env::var("VICTORY_SNAPSHOT_AT").unwrap_or_default();
+        Mutex::new(list.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+    });
+    let mut at = at.lock().unwrap_or_else(|e| e.into_inner());
+    let seconds = now as f64 / 1e9;
+    match at.iter().position(|&t| t <= seconds) {
+        Some(i) => {
+            at.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Writes snapshot `snap` as Markdown to `snapshots/<seconds>.md` (relative to
+/// the run's folder, where `run.sh` starts the title): frame times, the frame
+/// log's totals, the processor's spans by thread group, the card's time by
+/// pipeline, one frame's time line in order, and where the memory is.
+fn write_snapshot(snap: &Snap, laid: Option<&Laid>, vram: (u64, u64)) {
+    use std::fmt::Write;
+    let n = snap.frames.len().max(1) as f64;
+    let mut sorted = snap.frames.clone();
+    sorted.sort_by(f32::total_cmp);
+    let pick = |q: f64| sorted.get(((sorted.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0.0);
+    let mean = snap.frames.iter().map(|&f| f64::from(f)).sum::<f64>() / n;
+    let mut md = String::new();
+    let seconds = snap.started as f64 / 1e9;
+    let _ = writeln!(md, "# Snapshot at {seconds:.0} s, frame {}\n", crate::frame::current());
+    let _ = writeln!(md, "{} frames in {:.1} s: mean {mean:.1} ms ({:.1} fps), median {:.1}, p90 {:.1}, max {:.1}. Card memory {} of {} MB.\n",
+        snap.frames.len(), SNAP_NS as f64 / 1e9, 1000.0 / mean.max(0.001), pick(0.5), pick(0.9), pick(1.0), vram.0, vram.1);
+    let per = |t: T| snap.totals.get(t as usize).copied().unwrap_or(0) as f64 / n;
+    let _ = writeln!(md, "Per frame: card idle {:.1} ms ({:.1} behind us), up {:.1} MB, back {:.1} MB, present {:.1} ms.\n",
+        per(T::CardIdleUs) / 1e3, per(T::CardIdleBehindUs) / 1e3, per(T::CopyBytes) / 1e6, per(T::CopyBackBytes) / 1e6, per(T::PresentUs) / 1e3);
+    // processor
+    let _ = writeln!(md, "## Processor: spans per frame by thread\n\n| thread | span | ms | count |\n|---|---|---:|---:|");
+    let mut rows: Vec<(&String, &&'static str, f64, f64)> =
+        snap.spans.iter().map(|((g, name), (ns, c))| (g, name, *ns as f64 / 1e6 / n, f64::from(*c) / n)).collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0).then(b.2.total_cmp(&a.2)));
+    for (g, name, ms, count) in rows.iter().filter(|r| r.2 >= 0.05) {
+        let _ = writeln!(md, "| {g} | {name} | {ms:.2} | {count:.1} |");
+    }
+    // card
+    let all: f64 = snap.gpu.values().map(|v| v.0 as f64).sum::<f64>() / 1e3 / n;
+    let _ = writeln!(md, "\n## Card: time per frame by pipeline ({all:.1} ms in all)\n\n| pipeline | ms | count |\n|---|---:|---:|");
+    let mut gpu: Vec<(&String, f64, f64)> = snap.gpu.iter().map(|(k, (us, c))| (k, *us as f64 / 1e3 / n, f64::from(*c) / n)).collect();
+    gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (name, ms, count) in gpu.iter().take(60) {
+        let text = pipeline_text(name).to_lowercase();
+        let _ = writeln!(md, "| {text} `{name}` | {ms:.2} | {count:.1} |");
+    }
+    // time line
+    if let Some(laid) = laid {
+        let _ = writeln!(md, "\n## One frame in order ({:.1} ms)\n\nStart and length in ms from the frame's start; depth 1 is inside the span above it.\n\n| start | length | % | thread | depth | span |\n|---:|---:|---:|---|---:|---|", laid.ms);
+        let mut spans: Vec<&(f64, f64, u8, u8, &'static str)> = laid.spans.iter().filter(|sp| sp.3 < 3 && sp.1 >= laid.ms / 200.0).collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for sp in spans {
+            let group = GROUPS.get(sp.2 as usize).copied().unwrap_or("other");
+            let what = if sp.4.starts_with('[') { format!("{} `{}`", pipeline_text(sp.4).to_lowercase(), sp.4) } else { sp.4.to_owned() };
+            let _ = writeln!(md, "| {:.1} | {:.1} | {:.0} | {group} | {} | {what} |", sp.0, sp.1, sp.1 / laid.ms.max(0.001) * 100.0, sp.3);
+        }
+    }
+    // memory
+    #[cfg(feature = "diagnostics")]
+    {
+        let _ = writeln!(md, "\n## Memory\n\n| group | what | MB | count |\n|---|---|---:|---:|");
+        for (g, what, bytes, count) in crate::copystat::memory_rows() {
+            let _ = writeln!(md, "| {g} | {} | {:.0} | {count} |", what.trim(), bytes as f64 / f64::from(1u32 << 20));
+        }
+    }
+    let dir = std::path::Path::new("snapshots");
+    let file = dir.join(format!("{seconds:08.1}.md"));
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, md)) {
+        Ok(()) => tracing::info!("snapshot written: {}", std::fs::canonicalize(&file).unwrap_or(file).display()),
+        Err(e) => tracing::warn!(error = %e, "snapshot not written"),
+    }
 }
 
 /// Whether the title should not see virtual key `vk`: an arrow key while

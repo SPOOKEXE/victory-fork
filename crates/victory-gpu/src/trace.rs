@@ -60,7 +60,7 @@ fn file() -> bool {
 /// up (`crate::overlay`, which sums them by name).
 pub(crate) fn on() -> bool {
     #[cfg(windows)]
-    if crate::overlay::shown() {
+    if crate::overlay::shown() || crate::overlay::recording() {
         return true;
     }
     file()
