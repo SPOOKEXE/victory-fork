@@ -7641,7 +7641,9 @@ impl HostList {
         crate::shot::stamp(self);
         // Only the full form of device-removed data goes on: `light` and
         // `faults` make no text and set no marker, as with the data off.
-        if !dred_on() {
+        // With breadcrumbs on the texts are kept too (no marker command):
+        // the hang report names the command where the card stopped.
+        if !dred_on() && !crumbs_on() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -7666,12 +7668,12 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred_on() {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe { self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32) };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

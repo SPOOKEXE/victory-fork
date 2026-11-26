@@ -1299,6 +1299,8 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("clear render target {:#x}", record.resource as usize));
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -1343,6 +1345,8 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("clear depth {:#x} flags {flags}", record.resource as usize));
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 use crate::framelog::T;
 
-pub(crate) const WIDTH: u32 = 460;
+pub(crate) const WIDTH: u32 = 500;
 pub(crate) const HEIGHT: u32 = 300;
 /// Frames kept for the percentiles.
 const KEPT: usize = 240;
@@ -353,7 +353,7 @@ pub(crate) fn draw() -> Vec<u32> {
     }
     let first = (SCROLL.load(Relaxed) as usize).min(lines.len().saturating_sub(ROWS));
     SCROLL.store(first as u32, Relaxed);
-    let (bar_x, bar_w) = (150u32, WIDTH - 150 - 86);
+    let (bar_x, bar_w) = (150u32, WIDTH - 150 - 104);
     let mut y = 32;
     for (label, value) in lines.iter().skip(first).take(ROWS) {
         match value {
