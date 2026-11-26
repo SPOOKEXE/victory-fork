@@ -625,11 +625,61 @@ fn write_snapshot(snap: &Snap, laid: Option<&Laid>, vram: (u64, u64)) {
             let _ = writeln!(md, "| {g} | {} | {:.0} | {count} |", what.trim(), bytes as f64 / f64::from(1u32 << 20));
         }
     }
+    crumbs_markdown(&mut md);
     let dir = std::path::Path::new("snapshots");
     let file = dir.join(format!("{seconds:08.1}.md"));
     match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, md)) {
         Ok(()) => tracing::info!("snapshot written: {}", std::fs::canonicalize(&file).unwrap_or(file).display()),
         Err(e) => tracing::warn!(error = %e, "snapshot not written"),
+    }
+}
+
+/// The last breadcrumbs report (`crate::host`'s, when the card has not finished
+/// work in 2 s): when it came, its lines, and every command of the recording the
+/// card stopped in. Written to a snapshot file of its own at once, and added
+/// to every snapshot after it.
+static CRUMBS: Mutex<Option<(u64, Vec<String>, Vec<String>)>> = Mutex::new(None);
+
+/// A breadcrumbs report came: kept for the snapshots, and written now as
+/// `snapshots/hang-<seconds>.md` (the run may not live to the next present).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn breadcrumbs(lines: &[String], all: &[String]) {
+    use std::fmt::Write;
+    let now = crate::clock::now_ns();
+    *CRUMBS.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, lines.to_vec(), all.to_vec()));
+    let mut md = String::new();
+    let _ = writeln!(md, "# The card stopped (breadcrumbs) at {:.0} s, frame {}\n", now as f64 / 1e9, crate::frame::current());
+    crumbs_markdown(&mut md);
+    #[cfg(feature = "diagnostics")]
+    {
+        let _ = writeln!(md, "\n## Memory\n\n| group | what | MB | count |\n|---|---|---:|---:|");
+        for (g, what, bytes, count) in crate::copystat::memory_rows() {
+            let _ = writeln!(md, "| {g} | {} | {:.0} | {count} |", what.trim(), bytes as f64 / f64::from(1u32 << 20));
+        }
+    }
+    let dir = std::path::Path::new("snapshots");
+    let file = dir.join(format!("hang-{:08.1}.md", now as f64 / 1e9));
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, md)) {
+        Ok(()) => tracing::info!("breadcrumbs written: {}", std::fs::canonicalize(&file).unwrap_or(file).display()),
+        Err(e) => tracing::warn!(error = %e, "breadcrumbs not written"),
+    }
+}
+
+/// The last breadcrumbs report as Markdown, if there was one.
+fn crumbs_markdown(md: &mut String) {
+    use std::fmt::Write;
+    let crumbs = CRUMBS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((at, lines, all)) = crumbs.as_ref() else { return };
+    let _ = writeln!(md, "\n## Breadcrumbs (at {:.1} s)\n", *at as f64 / 1e9);
+    for line in lines {
+        let _ = writeln!(md, "- {}", line.replace('|', "\\|"));
+    }
+    if !all.is_empty() {
+        let _ = writeln!(md, "\n### Every command of the recording the card stopped in\n\n```text");
+        for line in all {
+            let _ = writeln!(md, "{line}");
+        }
+        let _ = writeln!(md, "```");
     }
 }
 

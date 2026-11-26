@@ -1835,54 +1835,77 @@ fn crumbs_keep(id: u32, notes: Vec<Note>, pipelines: std::collections::BTreeSet<
 /// (`VICTORY_D3D12_DRED=1`) the commands around where the card stopped.
 #[cfg(feature = "diagnostics")]
 fn crumbs_report(what: &str) {
+    let (lines, all) = crumbs_lines(what);
+    for line in &lines {
+        tracing::error!("{line}");
+    }
+    // (with every command of the recording the card stopped in, for the
+    // overlay's snapshot of it: `crate::overlay::breadcrumbs`)
+    crate::overlay::breadcrumbs(&lines, &all);
+}
+
+/// What [`crumbs_report`] says, line by line, and every command noted in the
+/// recording the card stopped in (the first not done marked).
+#[cfg(feature = "diagnostics")]
+fn crumbs_lines(what: &str) -> (Vec<String>, Vec<String>) {
+    let mut out = Vec::new();
     let Some((begun, done, begun_id, done_id)) = crumbs_read(false) else {
-        tracing::error!("{what} has not finished in 2 s (VICTORY_CRUMBS=1 would say where)");
-        return;
+        out.push(format!("{what} has not finished in 2 s (VICTORY_CRUMBS=1 would say where)"));
+        return (out, Vec::new());
     };
-    tracing::error!(
+    out.push(format!(
         "breadcrumbs: {what} has not finished in 2 s; words {begun:#010x} begun, {done:#010x} done \
          (0xfff1: our send-and-hash list, 0xfff2: our compare list, low 0xfffe: a list just started); \
          recordings {begun_id} begun, {done_id} done"
-    );
+    ));
     // A recording closed or reset since: its texts were kept.
     {
         let kept = CRUMB_KEPT.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, notes, pipelines)) = kept.iter().rev().find(|k| k.0 == begun_id) {
-            tracing::error!("breadcrumbs: recording {begun_id} (kept when it closed), its pipelines: {}", crate::pipeline::labelled(&format!("{pipelines:?}")));
+            out.push(format!(
+                "breadcrumbs: recording {begun_id} (kept when it closed), its pipelines: {}",
+                crate::pipeline::labelled(&format!("{pipelines:?}"))
+            ));
             let done = if done_id == begun_id { done & 0xffff } else { 0 };
-            crumbs_print(notes, done);
-            return;
+            let all = crumbs_print(&mut out, notes, done);
+            return (out, all);
         }
     }
     let lists = CRUMB_LISTS.lock().unwrap_or_else(|e| e.into_inner());
     // (A list in the table is alive: its drop takes it out under this lock.)
     let Some(list) = lists.as_ref().and_then(|m| m.get(&begun_id).copied()).map(|at| unsafe { &*(at as *const HostList) })
     else {
-        tracing::error!("breadcrumbs: no host list is recording {begun_id} now (it was reset since, or is a list of ours)");
-        return;
+        out.push(format!("breadcrumbs: no host list is recording {begun_id} now (it was reset since, or is a list of ours)"));
+        return (out, Vec::new());
     };
     let pipelines = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    tracing::error!("breadcrumbs: recording {begun_id}, its pipelines: {}", crate::pipeline::labelled(&format!("{pipelines:?}")));
+    out.push(format!("breadcrumbs: recording {begun_id}, its pipelines: {}", crate::pipeline::labelled(&format!("{pipelines:?}"))));
     let notes = list.notes.lock().unwrap_or_else(|e| e.into_inner());
     let (begun, done) = (begun & 0xffff, if done_id == begun_id { done & 0xffff } else { 0 });
     if begun == 0xfffe {
-        tracing::error!("breadcrumbs: the list had begun and none of its noted commands had");
-        return;
+        out.push("breadcrumbs: the list had begun and none of its noted commands had".to_owned());
+        return (out, Vec::new());
     }
-    crumbs_print(&notes, done);
+    let all = crumbs_print(&mut out, &notes, done);
+    (out, all)
 }
 
 /// The commands from the first one not done on (the begun marks run ahead:
-/// they are written as commands start, without waiting).
+/// they are written as commands start, without waiting), into `out`; every
+/// command of the list comes back, the first not done marked.
 #[cfg(feature = "diagnostics")]
-fn crumbs_print(notes: &[Note], done: u32) {
-    tracing::error!("breadcrumbs: {} commands noted in the list", notes.len());
+fn crumbs_print(out: &mut Vec<String>, notes: &[Note], done: u32) -> Vec<String> {
+    out.push(format!("breadcrumbs: {} commands noted in the list", notes.len()));
     let from = done.saturating_sub(2) as usize;
+    let line = |k: usize, text: &str, range: &Option<(u64, u64)>| {
+        format!("command {k}{}: {text} (reads {range:x?})", if k == done as usize { " (the first not done)" } else { "" })
+    };
     for k in from..(from + 8).min(notes.len()) {
         if let Some((text, range)) = notes.get(k) {
-            tracing::error!("breadcrumbs: command {k}{}: {text} (reads {range:x?})", if k == done as usize { " (the first not done)" } else { "" });
+            out.push(format!("breadcrumbs: {}", line(k, text, range)));
         }
     }
+    notes.iter().enumerate().map(|(k, (text, range))| line(k, &crate::pipeline::labelled(text), range)).collect()
 }
 
 /// The breadcrumbs (mark and command begun, all before done; the
