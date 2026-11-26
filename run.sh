@@ -163,6 +163,10 @@ if ((fast)); then
     # card is taken from the process after some seconds of it.
     default VICTORY_SHADER_LOOP_LIMIT 16384
 fi
+# The ocean's height and displacement maps the GPU writes are copied back into
+# title memory, where the CPU floats boats on them (without it the first boat
+# sinks, its engine is destroyed and the hull cuts a pit in the water).
+default VICTORY_TEXTURE_BACK 1
 
 stamp=$(date +%Y%m%d-%H%M%S)
 since=$(date '+%Y-%m-%d %H:%M:%S')
