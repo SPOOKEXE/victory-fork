@@ -293,14 +293,35 @@ fn block_class(size: usize) -> usize {
     }
 }
 
+/// Counts a block made or released in [`OWN`]: a thread adds into its own
+/// counts and moves them over every 256 blocks (every allocation of every
+/// thread on the same counters was 10 % of the submitting thread's time in
+/// a profile, the cache line passed from core to core).
 fn own(size: usize, made: bool) {
+    std::thread_local! {
+        static HERE: std::cell::Cell<([i64; 8], u32)> = const { std::cell::Cell::new(([0; 8], 0)) };
+    }
     let class = block_class(size);
-    if made {
-        OWN[class].fetch_add(size as u64, Relaxed);
-        OWN[4 + class].fetch_add(1, Relaxed);
-    } else {
-        OWN[class].fetch_sub(size as u64, Relaxed);
-        OWN[4 + class].fetch_sub(1, Relaxed);
+    let sign: i64 = if made { 1 } else { -1 };
+    let moved = HERE.try_with(|here| {
+        let (mut counts, mut n) = here.get();
+        counts[class] += sign * size as i64;
+        counts[4 + class] += sign;
+        n += 1;
+        if n >= 256 {
+            for (total, c) in OWN.iter().zip(counts) {
+                if c != 0 {
+                    total.fetch_add(c as u64, Relaxed);
+                }
+            }
+            (counts, n) = ([0; 8], 0);
+        }
+        here.set((counts, n));
+    });
+    // (a thread past its locals' end counts straight in)
+    if moved.is_err() {
+        OWN[class].fetch_add((sign * size as i64) as u64, Relaxed);
+        OWN[4 + class].fetch_add(sign as u64, Relaxed);
     }
 }
 
@@ -401,7 +422,7 @@ mod sites {
     }
 
     pub(super) fn made(at: *mut u8, size: usize) {
-        if !COUNT.fetch_add(1, Relaxed).is_multiple_of(SITE_EVERY) || !on() {
+        if ON.load(Relaxed) == 0 || !COUNT.fetch_add(1, Relaxed).is_multiple_of(SITE_EVERY) || !on() {
             return;
         }
         let entered = INSIDE.try_with(|i| !i.replace(true)).unwrap_or(false);
