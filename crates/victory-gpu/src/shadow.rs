@@ -3530,7 +3530,11 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let asked = {
+                let _span = crate::trace::span("merge: what the title wrote");
+                crate::watch::writes(a, e, true)
+            };
+            let Some((now, written)) = asked else {
                 MERGE_GAVE_UP[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
@@ -3556,7 +3560,11 @@ impl Shadow {
                 let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
                 // A page that is not there is left as it is, and looked at
                 // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
+                let read = {
+                    let _span = crate::trace::span("merge: the title's page read");
+                    crate::host::read_into(lo as *const u8, title)
+                };
+                if !read {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
@@ -3565,18 +3573,26 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
+                    let runs = {
+                        let _span = crate::trace::span("merge: compared with the copy");
+                        joined_over(changed_runs(title, held), merge_gap())
+                    };
                     if runs.len() > *runs_left {
                         MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
-                    for (r, m) in runs {
+                    let _span = crate::trace::span("merge: the title's bytes put in");
+                    let mut bytes = 0;
+                    for &(r, m) in &runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        bytes += m;
                     }
+                    // Noted for the card in one go, under one lock (once a
+                    // run was 80,000 lockings a frame in the café).
+                    self.card_changed_runs(at, &runs);
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
                         MERGE_GAVE_UP[3].fetch_add(1, Ordering::Relaxed);
@@ -3923,6 +3939,33 @@ impl Shadow {
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
+    /// [`Shadow::card_changed`] for each of `runs` (offset from `at`,
+    /// bytes), in order, under one taking of the lock.
+    fn card_changed_runs(&self, at: usize, runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if runs.is_empty() {
+            return;
+        }
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let first = dirty.is_empty();
+        for &(r, m) in runs.iter().filter(|r| r.1 > 0) {
+            let (from, to) = (at + r, at + r + m);
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
+        }
+        drop(dirty);
+        if first
+            && changed_kept()
+            && let Some(me) = card.me.get()
+        {
+            CHANGED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
+    }
+
     fn card_changed(&self, from: usize, to: usize) {
         let Some(card) = &self.card else {
             return;

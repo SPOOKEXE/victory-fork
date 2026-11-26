@@ -166,6 +166,10 @@ fi
 # A slot's resource is kept under its own piece's lock, not one line for the
 # heap (the café: some 4,600 waits a frame on the wide threads, 55 ms).
 default VICTORY_HEAP_LOCKS 1
+# Compute dispatches past 65,535 groups are cut, not spread across z (the
+# parent's default): spread, the first world scene stalled the card 2 to 5
+# times for over 2 s (runs Y and Y2); off, none (run Y3).
+default VICTORY_DISPATCH_SPREAD 0
 # Fills of upload memory wait for flights only where shaders have written
 # this run (one wait a frame in the café instead of two).
 default VICTORY_FILL_WAIT learn

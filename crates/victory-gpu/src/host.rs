@@ -4367,6 +4367,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let walking = crate::trace::span("under flights: the refreshed spans");
     if step_index() {
         // By copy (its address): its place in `spans`, or that no shader's
         // writes are pending on it. Asked once a copy, not once a step
@@ -4415,6 +4416,8 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             }
         }
     }
+    drop(walking);
+    let _span = crate::trace::span("under flights: merged or checked");
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
