@@ -60,11 +60,46 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+/// Page number → the asking that last found it written, in 64 parts by
+/// address (16 MiB of title memory to a part, in turn), each with its own
+/// lock: the wide refreshes read their answers from it at once, and one
+/// lock over all of it was 50 ms a frame of their waiting.
+struct Written([Mutex<BTreeMap<usize, u64>>; 64]);
+
+static PAGES_WRITTEN: Written = Written([const { Mutex::new(BTreeMap::new()) }; 64]);
+
+impl Written {
+    /// Pages to a part before the next part takes over.
+    const RUN: usize = 256;
+
+    fn part(&self, page: usize) -> std::sync::MutexGuard<'_, BTreeMap<usize, u64>> {
+        self.0[(page / Self::RUN) % 64].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn insert(&self, page: usize, asked: u64) -> Option<u64> {
+        self.part(page).insert(page, asked)
+    }
+
+    fn get(&self, page: usize) -> Option<u64> {
+        self.part(page).get(&page).copied()
+    }
+
+    /// The pages of `[first, last)` noted written, in order, with their askings.
+    fn collect(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        let mut out = Vec::new();
+        let mut at = first;
+        while at < last {
+            let end = ((at / Self::RUN + 1) * Self::RUN).min(last);
+            out.extend(self.part(at).range(at..end).map(|(&p, &w)| (p, w)));
+            at = end;
+        }
+        out
+    }
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -88,7 +123,6 @@ static IN_FLIGHT: std::sync::Condvar = std::sync::Condvar::new();
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -163,7 +197,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             }
             if let Some(written) = guard(first * PAGE, last * PAGE) {
                 for page in written {
-                    j.written.insert(page, j.ahead_asked);
+                    PAGES_WRITTEN.insert(page, j.ahead_asked);
                 }
                 j.ahead.push((first, last));
             }
@@ -330,7 +364,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+        PAGES_WRITTEN.insert(page, now);
     }
 }
 
@@ -353,10 +387,10 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = PAGES_WRITTEN.insert(page, now).unwrap_or(0);
     for &other in others {
         if other != page {
-            j.written.insert(other, now);
+            PAGES_WRITTEN.insert(other, now);
         }
     }
     (before, now)
@@ -366,7 +400,7 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
 /// never). Read only, for `crate::backreads`.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stamp(page: usize) -> u64 {
-    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.get(&page).copied().unwrap_or(0)
+    PAGES_WRITTEN.get(page).unwrap_or(0)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -422,7 +456,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+        PAGES_WRITTEN.insert(page, now);
     }
     true
 }
@@ -438,7 +472,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, PAGES_WRITTEN.collect(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -471,7 +505,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// the journal.
 fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let answer = |j: &Journal| j.written.range(first..last).map(|(&p, &w)| (p, w)).collect::<Vec<_>>();
+    let answer = || PAGES_WRITTEN.collect(first, last);
     {
         let mut j = contended(&JOURNAL, "journal lock wait");
         // An asking of other threads over this memory puts what it found
@@ -481,8 +515,11 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
             j = IN_FLIGHT.wait(j).unwrap_or_else(|e| e.into_inner());
         }
         // Asked ahead with the submission's other ranges: the journal has it.
+        // (Read without the journal held: its parts have locks of their own.)
         if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-            return Some((j.ahead_asked, answer(&j)));
+            let asked = j.ahead_asked;
+            drop(j);
+            return Some((asked, answer()));
         }
         // The light refresh: every block of the range is read-only by our hand
         // and unwritten since an asking noted it, or a hole noted for good
@@ -492,7 +529,9 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
         if guarded && light == 2 && published(&j, first * PAGE, last * PAGE) {
             LIGHT_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             j.asked += 1;
-            return Some((j.asked, answer(&j)));
+            let asked = j.asked;
+            drop(j);
+            return Some((asked, answer()));
         }
         j.in_flight.push((first, last));
     }
@@ -509,7 +548,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     j.asked += 1;
     let now = j.asked;
     for &page in &pages {
-        j.written.insert(page, now);
+        PAGES_WRITTEN.insert(page, now);
     }
     // The light refresh: the guards were asked, and what they found is
     // noted. The blocks they made clean are known by their bits from now
@@ -519,7 +558,8 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
         LIGHT_ASKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         publish(&j, &pages, first * PAGE, last * PAGE, told());
     }
-    Some((now, answer(&j)))
+    drop(j);
+    Some((now, answer()))
 }
 
 /// [`writes`]' question, with the journal not held: the pages of
@@ -1310,7 +1350,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     if by_bits && !published(&j, first * PAGE, last * PAGE) {
         return false;
     }
-    let same = j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]);
+    let same = PAGES_WRITTEN.collect(first, last).into_iter().all(|(page, write)| write <= taken[page - first]);
     if same && by_bits {
         LIGHT_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
