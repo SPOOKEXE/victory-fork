@@ -6023,7 +6023,11 @@ impl Host {
                         mine.extend(slots.iter_mut().filter_map(Option::take));
                     }
                     SPLIT_PARTS.fetch_add(1, Ordering::Relaxed);
+                    // (the title wrote its heaps before the whole submission: the
+                    // first part brings them over for all of them)
+                    LATER_PART.store(k > 0, Ordering::Relaxed);
                     self.execute_late_part(mine, sub_order);
+                    LATER_PART.store(false, Ordering::Relaxed);
                 }
                 return;
             }
@@ -6322,7 +6326,7 @@ impl Host {
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        {
+        if !LATER_PART.load(Ordering::Relaxed) {
             let _span = crate::trace::span("heap sync");
             let at = crate::clock::now_us();
             crate::descriptor::sync_heaps();
@@ -8543,6 +8547,10 @@ fn split_lists() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| std::env::var("VICTORY_SPLIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8))
 }
+
+/// The submission being prepared is a part of a title submission after its
+/// first ([`split_lists`]): the heaps were synced for the first.
+static LATER_PART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Parts sent by [`split_lists`] since the start.
 static SPLIT_PARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
