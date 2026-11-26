@@ -12,6 +12,9 @@ cbuffer Record : register(b0) {
     // Bit 3: dispatch records spread across z past 65,535 groups in x
     // (`crate::draw`'s spread command signature): record i goes to byte
     // 20 * i as [row, asked x, x, y, z], row 0 when not spread.
+    // Bit 4, with bit 2: the table's first word is the number of records
+    // (a window, `windowed`: the CPU adds records while the list is
+    // recorded), the offsets follow it.
     uint has_count;
     uint count_offset;
 };
@@ -45,6 +48,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
+    bool counted_table = (has_count & 16u) != 0;
+    if (counted_table) {
+        eff_count = min(eff_count, count_buf.Load(count_offset));
+    }
     // Threads past the records take part in the group's charge (cost 0)
     // and store nothing.
     bool active = id.x < eff_count;
@@ -53,7 +60,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // is a count of four bytes, or the source itself, and is not read here.)
     [branch]
     if ((has_count & 4u) != 0) {
-        src_at = count_buf.Load(count_offset + id.x * 4u);
+        src_at = count_buf.Load(count_offset + (counted_table ? 4u : 0u) + id.x * 4u);
     }
     uint dst_at = id.x * stride;
     bool spread = (has_count & 8u) != 0;
