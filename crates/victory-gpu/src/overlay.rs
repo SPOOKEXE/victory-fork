@@ -57,6 +57,7 @@ struct State {
     /// Where the memory is (F8; `crate::copystat::memory_rows`), taken
     /// every two seconds while that view is up, and when.
     memory_rows: Vec<(&'static str, String, u64, u64)>,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     memory_at: u64,
     summed: u32,
     since_ns: u64,

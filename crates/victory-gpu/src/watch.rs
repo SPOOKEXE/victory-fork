@@ -80,6 +80,7 @@ impl Written {
         self.part(page).insert(page, asked)
     }
 
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     fn get(&self, page: usize) -> Option<u64> {
         self.part(page).get(&page).copied()
     }

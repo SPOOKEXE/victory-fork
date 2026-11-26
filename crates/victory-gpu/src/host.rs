@@ -1328,6 +1328,23 @@ fn crumb(list: &ID3D12GraphicsCommandList, value: u32) {
     }
 }
 
+/// Waits for `event`, set when the card has run something: after two
+/// seconds (diagnostics) the breadcrumbs say where the card stands, before
+/// the wait that may never end.
+fn wait_for_card(event: HANDLE, what: &str) {
+    // SAFETY: an event of ours.
+    unsafe {
+        #[cfg(feature = "diagnostics")]
+        if WaitForSingleObject(event, 2_000) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+            crumbs_report(what);
+            WaitForSingleObject(event, INFINITE);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        WaitForSingleObject(event, INFINITE);
+    }
+    let _ = what;
+}
+
 /// What the breadcrumbs say after `what` did not finish: the raw words, the
 /// list their mark names (found by its mark among the host lists with
 /// breadcrumbs on), its pipelines, and with the commands noted
@@ -3882,7 +3899,7 @@ fn late_helper() {
         // SAFETY: our fence and event.
         unsafe {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                { let _sync = crate::trace::span("gpu sync: settle helper"); WaitForSingleObject(event, INFINITE); }
+                { let _sync = crate::trace::span("gpu sync: settle helper"); wait_for_card(event, "gpu sync: settle helper"); }
             }
         }
         {
@@ -5380,7 +5397,7 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
-                { let _sync = crate::trace::span("gpu sync: copy-back fetch"); WaitForSingleObject(event, INFINITE); }
+                { let _sync = crate::trace::span("gpu sync: copy-back fetch"); wait_for_card(event, "gpu sync: copy-back fetch"); }
                 Ok(after)
             })()
         };
@@ -5785,7 +5802,7 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    { let _sync = crate::trace::span("gpu sync: copy-back"); WaitForSingleObject(self.event, INFINITE); }
+                    { let _sync = crate::trace::span("gpu sync: copy-back"); wait_for_card(self.event, "gpu sync: copy-back"); }
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -6033,7 +6050,7 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
-                            { let _sync = crate::trace::span("gpu sync: settle"); WaitForSingleObject(self.event, INFINITE); }
+                            { let _sync = crate::trace::span("gpu sync: settle"); wait_for_card(self.event, "gpu sync: settle"); }
                             stood(waiting);
                             working(true);
                         }
