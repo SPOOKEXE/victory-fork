@@ -651,7 +651,12 @@ What did it, on top of the list below:
   12.6 against 12.2 fps: noise); `VICTORY_SHADER_LOOP_LIMIT=256` (the
   heaviest program, the screen probes' ray binning `cb6adcc6`, 3-8 ms a
   run against 13: its loops are the title's work, not runaway ones; its
-  translation has no group memory or wave emulation).
+  translation has no group memory or wave emulation);
+  `VICTORY_LEGACY_IEEE=1` (a measurement, wrong maths: the console's legacy
+  multiplies and multiply-adds without their zero rule and flushed
+  sources, which are a fifth to a third of the operations of programs like
+  the shadow masks): the title's lists on the card 60.9 -> 56.6 ms, 11.7 ->
+  12.1 fps, so an exact cheaper form of them would win at most that.
 - Frame rate, third session: measuring first (same RTX 4070, first room).
   - A frame log (`VICTORY_FRAME_LOG`, on in diagnostics builds): every
     frame's length, and for the usual frame and each long one what it was

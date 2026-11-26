@@ -3803,10 +3803,14 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 × anything = 0`, as in D3D9. With [`legacy_as_ieee`] a plain
+    /// multiply (a measurement).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        if legacy_as_ieee() {
+            return m;
+        }
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
@@ -3835,6 +3839,9 @@ impl<'a> Lower<'a> {
     fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
         let cur = self.cur;
         let fused = self.fmad(a, b, c);
+        if legacy_as_ieee() {
+            return fused;
+        }
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
@@ -7848,6 +7855,7 @@ impl<'a> Lower<'a> {
                     // On RDNA 2 the legacy encoding decodes as fused
                     // (`v_fma_legacy_f32`) and flushes its sources; the
                     // zero-factor rule of the legacy multiply comes with it.
+                    _ if legacy_as_ieee() => self.fmad(a, bb, acc),
                     _ => {
                         let (a, bb, acc) = (self.ftz(a), self.ftz(bb), self.ftz(acc));
                         self.legacy_fmad(a, bb, acc)
@@ -7863,7 +7871,7 @@ impl<'a> Lower<'a> {
             }
             "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let (a, bb, cc) = (self.ftz(a), self.ftz(bb), self.ftz(cc));
+                let (a, bb, cc) = if legacy_as_ieee() { (a, bb, cc) } else { (self.ftz(a), self.ftz(bb), self.ftz(cc)) };
                 let r = self.legacy_fmad(a, bb, cc);
                 float(self, r)
             }
@@ -13017,4 +13025,14 @@ mod tests {
         #[cfg(not(windows))]
         let _ = lowered;
     }
+}
+
+/// A measurement, not a translation (`VICTORY_LEGACY_IEEE=1`): the console's
+/// legacy multiplies and multiply-adds (`v_mul_legacy_f32`, `v_fma_legacy_f32`)
+/// as plain IEEE ones, without the zero-factor rule or the flushed sources.
+/// What the card saves is the most a cheaper exact form could win; a zero times
+/// an infinity then gives NaN where the console gives 0.
+fn legacy_as_ieee() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_IEEE").is_some_and(|v| v == "1"))
 }
