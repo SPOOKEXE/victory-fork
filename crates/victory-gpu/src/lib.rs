@@ -100,8 +100,8 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-#[cfg(windows)]
 pub use overlay::takes_key as overlay_takes_key;
+#[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{

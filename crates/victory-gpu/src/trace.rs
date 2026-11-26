@@ -160,6 +160,7 @@ pub(crate) fn frame() {
     if last != 0 {
         count("frame ms", (now - last) as f64 / 1e6);
     }
+    #[cfg(windows)]
     if frame.is_multiple_of(30)
         && let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory())
     {
