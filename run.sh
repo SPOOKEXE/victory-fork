@@ -225,6 +225,25 @@ watch_crash() {
     bundle "${why:0:300}"
 }
 watch_crash &
+# A build whose translator changed finds the shader cache cold: the shaders
+# earlier runs met (`shader-names.txt`, written by the layer) are translated
+# on every core first, instead of one by one as the title asks for them.
+# Once per build (`.warmed` holds the build's time); VICTORY_WARM=0 skips it.
+# The host facts join the cache key: a 32-lane card whose view heap holds
+# 1,000,000 views here (VICTORY_HOST_WAVE, VICTORY_VIEW_LIMIT set others).
+names=$home/cache/shader-names.txt
+warmed=$home/cache/.warmed
+if [[ -s $names && ${VICTORY_WARM:-1} != 0 && $(stat -c %Y "$exe") != "$(cat "$warmed" 2>/dev/null)" ]]; then
+    echo "warming the shader cache: $(wc -l < "$names") shaders on $(nproc) threads" >&2
+    if (cd "$home" && VICTORY_HOST_WAVE=${VICTORY_HOST_WAVE:-32} VICTORY_VIEW_LIMIT=${VICTORY_VIEW_LIMIT:-999999} \
+        "$wine/wine" "$exe" translate "$(win "$(dirname "$title")")" --warm "$(win "$names")" --jobs "$(nproc)") \
+        > "$home/logs/$stamp.warm.log" 2>&1; then
+        stat -c %Y "$exe" > "$warmed"
+        tail -n 1 "$home/logs/$stamp.warm.log" >&2
+    else
+        echo "warm-up failed: $home/logs/$stamp.warm.log" >&2
+    fi
+fi
 command=("$wine/wine" "$exe" run "$(win "$title")" --execute "$@")
 ((limit)) && command=(timeout --kill-after=20 "$limit" "${command[@]}")
 cd "$home"
