@@ -256,6 +256,13 @@ pub fn with_wave_wide_held<R>(held: bool, f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// What the per-program switches do to the translation made on this thread
+/// ([`with_wave_wide`], [`with_wave_wide_held`]), for the shader cache's key: those switches
+/// are not in the [`translation_fingerprint`], so only the programs they name key apart.
+pub fn wave_wide_flags() -> u8 {
+    u8::from(WIDE_HERE.get()) | u8::from(WIDE_HELD.get()) << 1
+}
+
 /// Whether the form with the halves meeting inside branches is tried before the
 /// approximate forms: by default (`VICTORY_WAVE_WIDE` unset or `1`) unless the program is
 /// held back ([`wave_wide_held`]), or for a program on `VICTORY_WAVE_WIDE_ONLY`'s list; not

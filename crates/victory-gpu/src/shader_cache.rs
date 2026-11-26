@@ -132,7 +132,11 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        // (past the build, and the per-program flags where `cached` put them: a container
+        // starts with `DXBC`, never 0xff)
+        let body = &input[32..];
+        let body = if body.first() == Some(&0xff) { &body[2..] } else { body };
+        let shader = (self.translate)(body).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
@@ -143,7 +147,9 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    // (a program a per-program switch names keys apart: `wave_wide_flags`)
+    let flags = victory_shader::emit::wave_wide_flags();
+    let input = if flags == 0 { [&build[..], container].concat() } else { [&build[..], &[0xff, flags][..], container].concat() };
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),

@@ -63,6 +63,11 @@ fn main() {
         }
     }
     println!("cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}{:016x}", state[0], state[1]);
+    // Switches that name programs (a list of hashes) key only the programs they name: the
+    // translation reports what they did to it (`emit::wave_wide_flags`), not the whole cache.
+    for per_program in ["VICTORY_WAVE_WIDE_HELD", "VICTORY_WAVE_WIDE_ONLY"] {
+        switches.remove(per_program);
+    }
     let joined: Vec<_> = switches.into_iter().collect();
     println!("cargo:rustc-env=VICTORY_SHADER_SWITCHES={}", joined.join(","));
 }
