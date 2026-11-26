@@ -139,32 +139,34 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
-/// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
+/// How long a host copy of a texture the title fills must have gone
+/// unused before the sweep lets it go (`crate::resource::let_go_idle`), by
+/// how full the card is; `None`: the sweep lets nothing go yet.
 ///
-/// A texture let go that the title uses again is made and uploaded anew:
-/// in the open world 17,119 of them, 9.6 GB, since the start, with the
-/// card at 85 % of its budget and textures idle a second let go. So they
-/// are kept long while there is room, and let go quickly only when the
-/// card is close to full.
-pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 30_000;
-    const MODERATE_MS: u64 = 10_000;
-    const HIGH_MS: u64 = 3_000;
-    const FULL_MS: u64 = 1_000;
+/// The sweep starts only when the card is close to its budget. Started at
+/// 85 % with copies idle 10 s (1 s when full) it let 79,000 copies go in
+/// five minutes of play and kept 16,000 alive (6 GB of a 22 GB budget):
+/// this title reaches most textures through slots it writes again every
+/// frame, so a copy no slot holds for a while is not unused, and each
+/// went and was made and uploaded again. Every such run lost the card
+/// within two to five minutes (Xid 13); with no sweep two runs of 15 and
+/// 16 minutes did not, and showed 42,000 copies (14.7 GB) with 1,677
+/// textures left without one once the card was full. Never less than
+/// 10 s, so handles not yet recorded into a list or slot stay protected.
+pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> Option<u64> {
+    const CLOSE_MS: u64 = 30_000;
+    const FULL_MS: u64 = 10_000;
     let Some([budget, used, ..]) = video_memory else {
-        return NORMAL_MS;
+        return Some(CLOSE_MS);
     };
     if budget == 0 {
-        return NORMAL_MS;
+        return Some(CLOSE_MS);
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
     match used_pct {
-        96.. => FULL_MS,
-        92.. => HIGH_MS,
-        85.. => MODERATE_MS,
-        _ => NORMAL_MS,
+        99.. => Some(FULL_MS),
+        95.. => Some(CLOSE_MS),
+        _ => None,
     }
 }
 
@@ -11680,18 +11682,17 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn vram_idle_ms_scales_with_pressure() {
         use super::vram_idle_ms;
         let gib = 1024 * 1024 * 1024;
-        // Room (< 85%): kept long.
-        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 30_000);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 30_000);
-        // Filling (85%..92%), close (92%..96%), full (>= 96%, over budget too).
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 10_000);
-        assert_eq!(vram_idle_ms(Some([100, 91, 0, 0])), 10_000);
-        assert_eq!(vram_idle_ms(Some([100, 92, 0, 0])), 3_000);
-        assert_eq!(vram_idle_ms(Some([100, 96, 0, 0])), 1_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
-        // Missing or zero budget falls back to normal
-        assert_eq!(vram_idle_ms(None), 30_000);
-        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 30_000);
+        // Room (< 95%): nothing goes.
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), None);
+        assert_eq!(vram_idle_ms(Some([100, 94, 0, 0])), None);
+        // Close (95%..99%), full (>= 99%, over budget too).
+        assert_eq!(vram_idle_ms(Some([100, 95, 0, 0])), Some(30_000));
+        assert_eq!(vram_idle_ms(Some([100, 98, 0, 0])), Some(30_000));
+        assert_eq!(vram_idle_ms(Some([100, 99, 0, 0])), Some(10_000));
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), Some(10_000));
+        // Missing or zero budget: as close to full.
+        assert_eq!(vram_idle_ms(None), Some(30_000));
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), Some(30_000));
     }
 
     #[test]

@@ -610,6 +610,18 @@ What did it, on top of the list below:
     for the flights (café: 160 ms frames to 98 at the same moment).
   - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
     the layer; it is how the above was found.
+  - The texture sweep and the card lost (Xid 13, a shader's memory
+    access, every two to six minutes of play on an RTX 4090): the sweep
+    began at 85 % of the card's budget and let go copies idle 10 s (1 s
+    when full), 79,000 in five minutes, and each one used again was made
+    anew. Every such run lost the card; with no sweep
+    (`VICTORY_TEXTURE_SWEEP=0`) two runs of 15 and 16 minutes did not.
+    Now the sweep starts at 95 % (copies idle 30 s; 10 s from 99 %), and
+    a copy let go is kept 30 s and given back if its texture is used
+    again (`VICTORY_SWEEP_GRACE_MS`, 0: retired at once): one run of 20
+    minutes without a loss. Keeping the copies let go alive for 10 s
+    without giving them back did not help, so it is not a read of freed
+    memory; what goes wrong with a copy made anew is not known yet.
 - Frame rate, third session: measuring first (same RTX 4070, first room).
   - A frame log (`VICTORY_FRAME_LOG`, on in diagnostics builds): every
     frame's length, and for the usual frame and each long one what it was

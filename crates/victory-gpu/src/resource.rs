@@ -1324,6 +1324,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
+        // Let go a moment ago: its own copy back ([`grace`]).
+        if let Some(back) = grace::take(this as usize) {
+            *made = Some(back);
+            crate::descriptor::texture_made(this as usize);
+            r.host.used.store(crate::host::moment(), Relaxed);
+            return made.clone();
+        }
         let clear = r
             .host
             .clear
@@ -1760,10 +1767,12 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - the card is close to its budget, and nothing asked for the copy for
+///   [`crate::host::vram_idle_ms`] and `IDLE_FRAMES` frames.
 ///
-/// The next use makes the host copy anew and uploads the title's memory
-/// again (its staging state goes with it). The title resource stays: its
+/// A copy let go is kept a while first ([`grace`]): a use in that time
+/// takes it back. A later use makes the host copy anew; either way the
+/// title's memory is uploaded again (its staging state goes with it). The title resource stays: its
 /// address is what views and lists name.
 /// shortcut: [`host_resource`] hands out the host texture without holding
 /// it; a thread that asked for it and has not yet recorded its use (which
@@ -1779,7 +1788,10 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    grace::expire();
+    let Some(idle_ms) = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory())) else {
+        return;
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1807,7 +1819,7 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
+        if let Some((host, twin)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -1816,17 +1828,106 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            grace::keep(at, (host, twin));
         }
     }
     if went > 0 {
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot), kept {} ms in case they are used again ({} given back since the start); the first: title texture {:#x}",
                 bytes >> 10,
+                grace::ms(),
+                grace::GIVEN_BACK[0].load(Relaxed),
                 first.unwrap_or(0)
             )
         });
+    }
+}
+
+/// Host copies [`let_go_idle`] let go, kept [`grace::MS`] before they are
+/// retired: a title texture used again in that time gets its own copy back
+/// ([`hosted`]) instead of a new one.
+///
+/// Why: every run whose sweep let copies go and made new ones for the
+/// textures used again lost the card within two to six minutes (Xid 13, a
+/// shader's memory access; six runs), also with the copies let go kept
+/// alive 10 s (so not a read of freed memory). With the copies given back
+/// instead (`VICTORY_SWEEP_GRACE_MS=10000`, one run of 20 minutes with
+/// 32,611 let go and 13 made new) and with no sweep (two runs of 15 and 16
+/// minutes) it did not. What goes wrong with a copy made anew is not
+/// known; this makes it rare, not impossible.
+/// `VICTORY_SWEEP_GRACE_MS=0` retires at once, as before.
+#[cfg(windows)]
+mod grace {
+    use super::Made;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    struct Kept(std::time::Instant, Made);
+    // SAFETY: D3D12 objects (free-threaded) and the reference-counted
+    // wrappers holding them, as `crate::host::retire` takes them.
+    unsafe impl Send for Kept {}
+
+    /// By title texture address.
+    static KEPT: std::sync::Mutex<Option<std::collections::HashMap<usize, Kept>>> = std::sync::Mutex::new(None);
+
+    /// Copies given back since the start, and their bytes.
+    pub(crate) static GIVEN_BACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    /// Milliseconds a copy is kept (30 s unless set).
+    pub(super) fn ms() -> u64 {
+        static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *MS.get_or_init(|| std::env::var("VICTORY_SWEEP_GRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000))
+    }
+
+    /// Keeps `made`, the host side title texture `at` let go.
+    pub(super) fn keep(at: usize, made: Made) {
+        if ms() == 0 {
+            crate::host::retire(made);
+            return;
+        }
+        let old = KEPT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(at, Kept(std::time::Instant::now(), made));
+        if let Some(old) = old {
+            crate::host::retire(old.1);
+        }
+    }
+
+    /// Retires the copies kept their time. Called by every sweep, whether
+    /// or not it lets anything go.
+    pub(super) fn expire() {
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        if let Some(kept) = KEPT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            kept.retain(|_, k| {
+                let keep = (now - k.0).as_millis() < u128::from(ms());
+                if !keep {
+                    due.push(k.1.clone());
+                }
+                keep
+            });
+        }
+        for made in due {
+            crate::host::retire(made);
+        }
+    }
+
+    /// Title texture `at`'s copy, if it is kept: taken back.
+    pub(super) fn take(at: usize) -> Option<Made> {
+        let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner()).as_mut()?.remove(&at)?;
+        GIVEN_BACK[0].fetch_add(1, Relaxed);
+        GIVEN_BACK[1].fetch_add(kept.1.0.bytes, Relaxed);
+        Some(kept.1)
+    }
+
+    /// Title texture `at` is released: its kept copy, if any, is retired.
+    pub(super) fn forget(at: usize) {
+        let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|k| k.remove(&at));
+        if let Some(kept) = kept {
+            crate::host::retire(kept.1);
+        }
     }
 }
 
@@ -2346,6 +2447,7 @@ impl Drop for Resource {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
             textures().remove(&address);
+            grace::forget(address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
