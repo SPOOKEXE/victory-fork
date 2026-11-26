@@ -10473,10 +10473,12 @@ impl Host {
         if width < w + AT || height < h + AT {
             return;
         }
-        let Some((pixels, runs)) = crate::overlay::pixels(format, k) else {
+        let Some(picture) = crate::overlay::pixels(format, k) else {
             return;
         };
-        struct Ring(Vec<(ID3D12Resource, usize, u32)>, usize);
+        /// The upload buffers: buffer, mapping, scale, and the number of the
+        /// picture it holds (0: none); the next to use.
+        struct Ring(Vec<(ID3D12Resource, usize, u32, u64)>, usize);
         // SAFETY: free-threaded host buffers and mappings kept for good.
         unsafe impl Send for Ring {}
         static RING: Mutex<Ring> = Mutex::new(Ring(Vec::new(), 0));
@@ -10491,13 +10493,26 @@ impl Host {
             let Some((buffer, data)) = self.upload_buffer(u64::from(pitch * h)) else {
                 return;
             };
-            ring.0.push((buffer, data as usize, k));
+            ring.0.push((buffer, data as usize, k, 0));
         }
-        let at = ring.1 % ring.0.len();
-        ring.1 += 1;
-        let (buffer, data, _) = &ring.0[at];
-        // SAFETY: the mapped upload buffer holds `pitch * h` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr().cast::<u8>(), *data as *mut u8, (pitch * h) as usize) };
+        // A buffer that holds this picture already is used again as it is
+        // (a present in the air may read it, and reads the same); else the
+        // next one in turn, written.
+        let at = match ring.0.iter().position(|b| b.3 == picture.number) {
+            Some(at) => at,
+            None => {
+                let at = ring.1 % ring.0.len();
+                ring.1 += 1;
+                let (_, data, _, held) = &mut ring.0[at];
+                // SAFETY: the mapped upload buffer holds `pitch * h` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(picture.pixels.as_ptr().cast::<u8>(), *data as *mut u8, (pitch * h) as usize)
+                };
+                *held = picture.number;
+                at
+            }
+        };
+        let (buffer, _, _, _) = &ring.0[at];
         let source = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::ManuallyDrop::new(Some(buffer.clone())),
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -10515,7 +10530,7 @@ impl Host {
         };
         // A box a lit run (at scale 1: `k` rows of `k` times its columns),
         // so the game shows through around them.
-        for (row, from, cols) in runs {
+        for &(row, from, cols) in &picture.runs {
             let b = D3D12_BOX { left: from * k, top: row * k, front: 0, right: (from + cols) * k, bottom: (row + 1) * k, back: 1 };
             // SAFETY: an open list, the back buffer in the copy destination
             // state and our buffer; the overlay fits inside the back buffer.

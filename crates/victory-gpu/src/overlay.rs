@@ -1047,7 +1047,44 @@ pub(crate) fn scale(height: u32) -> u32 {
 /// for 8-bit RGBA or BGRA and 10-bit RGB; `None` for other formats), and
 /// its lit runs at scale 1 (row, first column, columns): only those are
 /// copied, so nothing hides the game around them.
-pub(crate) fn pixels(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, k: u32) -> Option<(Vec<u32>, Vec<(u32, u32, u32)>)> {
+/// The overlay as shown: its pixels at scale `k` in the back buffer's
+/// format, the lit runs of its rows (scale 1), and a number no other
+/// picture has (the upload buffers that hold it are not written again).
+pub(crate) struct Picture {
+    pub(crate) pixels: Vec<u32>,
+    pub(crate) runs: Vec<(u32, u32, u32)>,
+    pub(crate) number: u64,
+}
+
+/// How long a picture of the overlay is shown before it is drawn again.
+/// Drawn at every present it was 14.5 ms of the render thread's frame
+/// (layout, text, the outline of every pixel, the scaling): the overlay
+/// slowed the frames it measured.
+const PICTURE_NS: u64 = 250_000_000;
+
+/// The overlay's picture for a back buffer of `format` at scale `k`: the
+/// last one if it is younger than [`PICTURE_NS`] and of the same kind,
+/// else drawn now.
+pub(crate) fn pixels(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, k: u32) -> Option<std::sync::Arc<Picture>> {
+    static LAST: Mutex<Option<(u64, i32, u32, std::sync::Arc<Picture>)>> = Mutex::new(None);
+    let now = crate::clock::now_ns();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, f, scale, picture)) = last.as_ref()
+        && *f == format.0
+        && *scale == k
+        && now.saturating_sub(*at) < PICTURE_NS
+    {
+        return Some(picture.clone());
+    }
+    let (pixels, runs) = draw_pixels(format, k)?;
+    let number = last.as_ref().map_or(1, |l| l.3.number + 1);
+    let picture = std::sync::Arc::new(Picture { pixels, runs, number });
+    *last = Some((now, format.0, k, picture.clone()));
+    Some(picture)
+}
+
+/// The overlay drawn now: pixels at scale `k` in `format`, and the lit runs.
+fn draw_pixels(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, k: u32) -> Option<(Vec<u32>, Vec<(u32, u32, u32)>)> {
     use windows::Win32::Graphics::Dxgi::Common::*;
     let convert: fn(u32) -> u32 = match format {
         DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => |p| p,
@@ -1100,8 +1137,10 @@ mod tests {
         assert_eq!(px.len(), (super::WIDTH * super::HEIGHT) as usize);
         assert!(px.iter().any(|&p| p == 0xfff0_f0f0), "some text");
         assert!(px.iter().any(|&p| p == 0), "the game shows through");
-        let (_, runs) = super::pixels(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, 2).unwrap();
-        assert!(!runs.is_empty() && runs.iter().all(|r| r.2 > 0));
+        let picture = super::pixels(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, 2).unwrap();
+        assert!(!picture.runs.is_empty() && picture.runs.iter().all(|r| r.2 > 0));
+        let again = super::pixels(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, 2).unwrap();
+        assert_eq!(again.number, picture.number, "within a quarter second: the same picture");
         for c in "0123456789FPSMS".chars() {
             assert!(super::glyph(c).iter().any(|&r| r != 0), "{c}");
         }
