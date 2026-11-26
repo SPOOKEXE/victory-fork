@@ -2401,10 +2401,24 @@ impl HostHeap {
         } else {
             // (the heap outlives the call: `wide_run` returns when every piece is done)
             let heap = self as *const HostHeap as usize;
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = due
-                .chunks(PIECE)
+            // Pieces of whole locks of `made`: slots by `index % MADE_PIECES`,
+            // so no two threads take the same lock. (Pieces of consecutive
+            // slots each went through all the locks in step: 800 waits a
+            // frame among the wide threads, 24 ms.)
+            let mut by_lock: Vec<Vec<(u32, u64)>> = vec![Vec::new(); MADE_PIECES as usize];
+            for (index, handle) in due {
+                by_lock[(index % MADE_PIECES) as usize].push((index, handle));
+            }
+            let mut pieces: Vec<Vec<(u32, u64)>> = Vec::new();
+            for slots in by_lock.into_iter().filter(|s| !s.is_empty()) {
+                match pieces.last_mut() {
+                    Some(last) if last.len() < PIECE => last.extend(slots),
+                    _ => pieces.push(slots),
+                }
+            }
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
+                .into_iter()
                 .map(|piece| {
-                    let piece = piece.to_vec();
                     Box::new(move || {
                         let _span = crate::trace::span("heap sync: make slots");
                         // SAFETY: see above.

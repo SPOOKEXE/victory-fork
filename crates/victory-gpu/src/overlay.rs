@@ -36,6 +36,10 @@ static SHOWN: AtomicBool = AtomicBool::new(false);
 static VIEW: AtomicU32 = AtomicU32::new(0);
 /// The first row shown, and the depth.
 static SCROLL: AtomicU32 = AtomicU32::new(0);
+/// The rows the shown view had when it was last drawn, and how many fit:
+/// the scroll's limit. (The scroll itself is never cut to a drawing: while
+/// a view's rows are made again it may have none for a moment.)
+static ROWS_SEEN: AtomicU32 = AtomicU32::new(0);
 static DEPTH: AtomicU32 = AtomicU32::new(3);
 
 struct State {
@@ -346,10 +350,10 @@ pub(crate) fn frame() {
         if shown() && front {
             let at = SCROLL.load(Relaxed);
             if pressed(1) {
-                SCROLL.store(at.saturating_sub(4), Relaxed);
+                SCROLL.store(at.min(ROWS_SEEN.load(Relaxed)).saturating_sub(4), Relaxed);
             }
             if pressed(2) {
-                SCROLL.store(at + 4, Relaxed);
+                SCROLL.store((at + 4).min(ROWS_SEEN.load(Relaxed)), Relaxed);
             }
             let depth = DEPTH.load(Relaxed);
             if pressed(3) {
@@ -895,7 +899,9 @@ pub(crate) fn draw() -> Vec<u32> {
     // (the time line's list has the rows left under its bars)
     let room = if view == 3 { ((HEIGHT - 12).saturating_sub(top) / ROW) as usize } else { ROWS };
     let first = (SCROLL.load(Relaxed) as usize).min(lines.len().saturating_sub(room));
-    SCROLL.store(first as u32, Relaxed);
+    if !lines.is_empty() {
+        ROWS_SEEN.store(lines.len().saturating_sub(room) as u32, Relaxed);
+    }
     // (the card's view: wider names, the shaders' own)
     let names = if view == 1 || view == 3 || view == 4 { 228 } else { 150 };
     let (bar_x, bar_w) = (names, WIDTH - names - 104);

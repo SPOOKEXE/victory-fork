@@ -10402,8 +10402,12 @@ impl Host {
             list.CopyResource(&back, texture);
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
-            crate::fpsbox::draw(self, list, &back, (width, height, format));
+            {
+                let _span = crate::trace::span("show: the corner box");
+                crate::fpsbox::draw(self, list, &back, (width, height, format));
+            }
             if crate::overlay::shown() {
+                let _span = crate::trace::span("show: the overlay");
                 self.overlay_onto(list, &back, format, width, height);
             }
             #[cfg(feature = "diagnostics")]
@@ -10423,12 +10427,15 @@ impl Host {
                 ),
             ]);
             copy.close();
-            match slot {
-                Some(i) => {
-                    let flown = self.execute_own(copy);
-                    p.ahead[i].1 = flown;
+            {
+                let _span = crate::trace::span(if slot.is_some() { "show: the copy sent ahead" } else { "show: the copy, run and waited for" });
+                match slot {
+                    Some(i) => {
+                        let flown = self.execute_own(copy);
+                        p.ahead[i].1 = flown;
+                    }
+                    None => self.execute(&[copy]),
                 }
-                None => self.execute(&[copy]),
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
@@ -10437,7 +10444,10 @@ impl Host {
             // What Present answers was thrown away: a removal it is the
             // first to report then looked as if the next call found it.
             // Said once (a status that is no error, as "occluded", is not).
-            let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = {
+                let _span = crate::trace::span("show: the swap chain's Present");
+                p.swap_chain.Present(0, DXGI_PRESENT(0))
+            };
             if shown.is_err() {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
