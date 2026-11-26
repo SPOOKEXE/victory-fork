@@ -1715,7 +1715,19 @@ fn crumbs() -> Option<&'static (ID3D12Resource, u64, usize)> {
 #[cfg(feature = "diagnostics")]
 fn crumbs_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CRUMBS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CRUMBS").is_some_and(|v| v == "1" || v == "serial"))
+}
+
+/// `VICTORY_CRUMBS=serial`: breadcrumbs, and every noted command waits for
+/// the ones before it to finish (a barrier on all unordered access before
+/// it). Without it the card runs a list's draws side by side and the
+/// breadcrumbs only bound where it stopped (a hang's report has shown a
+/// hundred commands begun past the first not done); with it the first
+/// command not done is the one that faulted. Slower.
+#[cfg(feature = "diagnostics")]
+fn crumbs_serial() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CRUMBS").is_some_and(|v| v == "serial"))
 }
 
 /// Host lists by their breadcrumb mark, noted at each reset with
@@ -8295,6 +8307,17 @@ impl HostList {
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
             if crumbs().is_some() {
+                if crumbs_serial() {
+                    let barrier = D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                        },
+                    };
+                    // SAFETY: an open list; a barrier on all unordered access.
+                    unsafe { self.list.ResourceBarrier(&[barrier]) };
+                }
                 let id = crumb_list(self);
                 let value = if timing() { at } else { (id & 0xffff) << 16 | (at & 0xffff) };
                 crumb_words(&self.list, value, id);
