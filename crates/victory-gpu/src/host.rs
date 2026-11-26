@@ -8535,17 +8535,21 @@ struct Batch {
     fills: Vec<(usize, usize, usize)>,
 }
 
-/// Lists a title submission sent ahead is cut into (`VICTORY_SPLIT_LISTS`,
-/// default 8; 0: not cut): each part is prepared and sent as a submission
+/// Lists a title submission sent ahead is cut into (`VICTORY_SPLIT_LISTS=<n>`;
+/// unset or 0: not cut, the default): each part is prepared and sent as a submission
 /// of its own, in order on the same queue, so the card starts on the first
 /// part while the next is prepared (the time line, F7: the card idle while
 /// a submission of many lists was prepared, 61 ms for one of them). The
 /// title's fence signals and value writes follow the last part, as they
 /// followed the whole. A part that reads what an earlier part's shaders
 /// write waits for it to land, as any submission sent ahead does.
+/// Off by default: with parts of 8 the faces lost their skin's detail (a
+/// later part read what an earlier part's skinning had not given back yet,
+/// it seems), and the frame was no shorter (181 ms either way in the
+/// police car scene; the card idle 60 ms against 55).
 fn split_lists() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_SPLIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8))
+    *N.get_or_init(|| std::env::var("VICTORY_SPLIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
 /// The submission being prepared is a part of a title submission after its
