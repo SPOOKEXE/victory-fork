@@ -163,6 +163,9 @@ if ((fast)); then
     # card is taken from the process after some seconds of it.
     default VICTORY_SHADER_LOOP_LIMIT 16384
 fi
+# A slot's resource is kept under its own piece's lock, not one line for the
+# heap (the café: some 4,600 waits a frame on the wide threads, 55 ms).
+default VICTORY_HEAP_LOCKS 1
 # Fills of upload memory wait for flights only where shaders have written
 # this run (one wait a frame in the café instead of two).
 default VICTORY_FILL_WAIT learn

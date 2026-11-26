@@ -228,7 +228,13 @@ fn locked<T>(lock: &Mutex<T>, at: usize) -> std::sync::MutexGuard<'_, T> {
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             let started = std::time::Instant::now();
-            let _span = crate::trace::span("heap lock wait");
+            // (named by the lock: [`LOCKS`]' place)
+            let _span = crate::trace::span(match at {
+                4 => "heap lock wait: slots' records",
+                11 => "heap lock wait: slots' resources",
+                13 => "heap lock wait: dynamic slots",
+                _ => "heap lock wait",
+            });
             let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             LOCKS[at].fetch_add(1, Relaxed);
             LOCKS[at + 1].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
