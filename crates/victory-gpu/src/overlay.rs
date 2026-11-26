@@ -30,9 +30,9 @@ const ROW: u32 = 9;
 const DEPTHS: [usize; 4] = [1, 3, 6, usize::MAX];
 
 static SHOWN: AtomicBool = AtomicBool::new(false);
-/// Which view is up: the processor's spans (F9) or the card's time by
-/// pipeline (F10).
-static GPU_VIEW: AtomicBool = AtomicBool::new(false);
+/// Which view is up: 0 the processor's spans (F9), 1 the card's time by
+/// pipeline (F10), 2 where the memory is (F8).
+static VIEW: AtomicU32 = AtomicU32::new(0);
 /// The first row shown, and the depth.
 static SCROLL: AtomicU32 = AtomicU32::new(0);
 static DEPTH: AtomicU32 = AtomicU32::new(3);
@@ -54,11 +54,15 @@ struct State {
     /// last half second, then per frame (ms, count) over the one before.
     gpu: HashMap<String, (u64, u32)>,
     gpu_rows: Vec<(String, f64, f64)>,
+    /// Where the memory is (F8; `crate::copystat::memory_rows`), taken
+    /// every two seconds while that view is up, and when.
+    memory_rows: Vec<(&'static str, String, u64, u64)>,
+    memory_at: u64,
     summed: u32,
     since_ns: u64,
     vram: (u64, u64),
-    /// F9, Up, Down, Left, Right, F10 as last seen.
-    keys: [bool; 6],
+    /// F9, Up, Down, Left, Right, F10, F8 as last seen.
+    keys: [bool; 7],
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -81,7 +85,7 @@ pub fn shown() -> bool {
 /// Whether the card's view (F10) is up: the card meter then times every
 /// pipeline (`crate::cardmeter::pipelines`).
 pub(crate) fn gpu_shown() -> bool {
-    shown() && GPU_VIEW.load(Relaxed)
+    shown() && VIEW.load(Relaxed) == 1
 }
 
 /// The card ran pipeline `name` for `us` (a pair of the card meter, read
@@ -154,25 +158,27 @@ pub(crate) fn frame() {
         rows: Vec::new(),
         gpu: HashMap::new(),
         gpu_rows: Vec::new(),
+        memory_rows: Vec::new(),
+        memory_at: 0,
         summed: 0,
         since_ns: now,
         vram: (0, 0),
-        keys: [false; 6],
+        keys: [false; 7],
     });
     {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         // SAFETY: plain queries.
-        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
+        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
         let pressed = |k: usize| down[k] && !s.keys[k];
         let front = focused();
-        // F9 the processor's view, F10 the card's: the same key again hides
-        // it, the other key switches to the other view.
-        for (key, gpu) in [(0, false), (5, true)] {
+        // F9 the processor's view, F10 the card's, F8 the memory's: the
+        // same key again hides it, another key switches to its view.
+        for (key, view) in [(0, 0), (5, 1), (6, 2)] {
             if pressed(key) && front {
-                if shown() && GPU_VIEW.load(Relaxed) == gpu {
+                if shown() && VIEW.load(Relaxed) == view {
                     SHOWN.store(false, Relaxed);
                 } else {
-                    GPU_VIEW.store(gpu, Relaxed);
+                    VIEW.store(view, Relaxed);
                     SHOWN.store(true, Relaxed);
                     SCROLL.store(0, Relaxed);
                 }
@@ -233,6 +239,11 @@ pub(crate) fn frame() {
         s.gpu_rows.sort_by(|a, b| b.1.total_cmp(&a.1));
         s.summed = 0;
         s.since_ns = now;
+        #[cfg(feature = "diagnostics")]
+        if shown() && VIEW.load(Relaxed) == 2 && now - s.memory_at >= 2_000_000_000 {
+            s.memory_at = now;
+            s.memory_rows = crate::copystat::memory_rows();
+        }
         if shown()
             && let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory())
         {
@@ -290,14 +301,36 @@ pub(crate) fn draw() -> Vec<u32> {
         TEXT,
     );
     let depth = DEPTHS[DEPTH.load(Relaxed) as usize];
-    let mut lines: Vec<(String, Option<(f64, f64)>)> = Vec::new();
-    if GPU_VIEW.load(Relaxed) {
+    let mut lines: Vec<(String, Option<(f64, f64, f64)>)> = Vec::new();
+    let view = VIEW.load(Relaxed);
+    if view == 2 {
+        // Where the memory is: each row a bar against the card's budget
+        // (card rows) or the process's private bytes (the others).
+        text_at(&mut px, 2, 22, "MEMORY (F9: PROCESSOR, F10: CARD)                   MB     N", HEAD);
+        let budget = s.memory_rows.iter().find(|r| r.1.starts_with("budget")).map_or(1, |r| r.2.max(1));
+        let private = s.memory_rows.iter().find(|r| r.1 == "process private").map_or(1, |r| r.2.max(1));
+        let mut group = "";
+        for (g, what, bytes, count) in &s.memory_rows {
+            if *g != group {
+                group = g;
+                lines.push((g.to_uppercase(), None));
+            }
+            let of = if *g == "card memory" { budget } else { private };
+            // (The bar's length is taken from the share; the numbers shown
+            // are MB and the count.)
+            let mb = |b: u64| b as f64 / f64::from(1u32 << 20);
+            lines.push((what.to_uppercase(), Some((mb(*bytes), *count as f64, mb(of)))));
+        }
+        if s.memory_rows.is_empty() {
+            lines.push(("(TAKEN EVERY TWO SECONDS)".to_owned(), None));
+        }
+    } else if view == 1 {
         // The card's view: its time by pipeline, heaviest first.
         text_at(&mut px, 2, 22, "CARD PER FRAME (F9: PROCESSOR)                      MS     X", HEAD);
         let all: f64 = s.gpu_rows.iter().map(|r| r.1).sum();
         lines.push((format!("ALL PIPELINES {all:.1} MS"), None));
         for (name, ms, count) in &s.gpu_rows {
-            lines.push((name.trim_matches(|c| c == '[' || c == ']').to_uppercase(), Some((*ms, *count))));
+            lines.push((name.trim_matches(|c| c == '[' || c == ']').to_uppercase(), Some((*ms, *count, frame))));
         }
         if s.gpu_rows.is_empty() {
             lines.push(("(THE CARD'S TIMES ARRIVE A SECOND AND A HALF LATE)".to_owned(), None));
@@ -313,7 +346,7 @@ pub(crate) fn draw() -> Vec<u32> {
             }
             in_group += 1;
             if in_group <= depth {
-                lines.push((name.to_uppercase(), Some((*ms, *count))));
+                lines.push((name.to_uppercase(), Some((*ms, *count, frame))));
             }
         }
     }
@@ -324,9 +357,9 @@ pub(crate) fn draw() -> Vec<u32> {
     for (label, value) in lines.iter().skip(first).take(ROWS) {
         match value {
             None => text_at(&mut px, 2, y, label, HEAD),
-            Some((v, count)) => {
+            Some((v, count, full)) => {
                 text_at(&mut px, 8, y, &label.chars().take(23).collect::<String>(), TEXT);
-                let share = v / frame.max(1.0);
+                let share = v / full.max(1.0);
                 let len = (share.min(1.0) * f64::from(bar_w)) as u32;
                 let colour = match share {
                     f if f >= 0.25 => 0xffe0_5050,
@@ -338,7 +371,8 @@ pub(crate) fn draw() -> Vec<u32> {
                         put(&mut px, x, yy, colour);
                     }
                 }
-                text_at(&mut px, bar_x + bar_w + 4, y, &format!("{v:6.1}{count:6.1}"), TEXT);
+                let numbers = if view == 2 { format!("{v:7.0}{count:7.0}") } else { format!("{v:6.1}{count:6.1}") };
+                text_at(&mut px, bar_x + bar_w + 4, y, &numbers, TEXT);
             }
         }
         y += ROW;

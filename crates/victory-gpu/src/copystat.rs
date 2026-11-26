@@ -677,6 +677,59 @@ fn log_memory_map() {
     );
 }
 
+/// Where the memory is, for the overlay's memory view (F8): (group, what,
+/// bytes, how many; 0 where a count says nothing), from the same counters
+/// as the memory lines of the log. Walks every title texture (the census):
+/// asked every two seconds while the view is up.
+pub(crate) fn memory_rows() -> Vec<(&'static str, String, u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (working, private) = process_memory();
+    let (free, left) = system_memory();
+    let copies = crate::shadow::memory();
+    let staged = crate::texture::memory();
+    let census = crate::resource::census();
+    let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
+    let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
+    let card = crate::host::host().and_then(|h| h.video_memory()).unwrap_or_default();
+    let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
+    let window = crate::shadow::window_use();
+    let views = crate::descriptor::views_kept();
+    let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
+    let kept = crate::pipeline::kept();
+    let mut rows = vec![
+        ("card memory", "in use (of the budget below)".to_owned(), card[1], 0),
+        ("card memory", "budget the system gives us".to_owned(), card[0], 0),
+        ("card memory", "host textures, all".to_owned(), textures[1], textures[0]),
+        ("card memory", " textures the title fills".to_owned(), census[5], census[4]),
+        ("card memory", " targets the host renders to".to_owned(), census[1], census[0]),
+        ("card memory", " made again after being let go".to_owned(), kinds[5], kinds[4]),
+        ("card memory", "PC memory shared with the card".to_owned(), card[3], 0),
+        ("title memory", "title textures with no host copy".to_owned(), census[3], census[2]),
+        ("PC memory", "process private".to_owned(), private, 0),
+        ("PC memory", "process in memory (working set)".to_owned(), working, 0),
+        ("PC memory", "copies of title memory".to_owned(), copies[1], copies[0]),
+        ("PC memory", " windows outside buffers".to_owned(), copies[3], copies[2]),
+        ("PC memory", " snapshot buffers".to_owned(), copies[5], copies[4]),
+        ("PC memory", "staging of textures".to_owned(), staged[1], staged[0]),
+        ("PC memory", "host lists' scratch".to_owned(), alive[2], alive[1]),
+        ("PC memory", " of it spare".to_owned(), alive[4], alive[3]),
+        ("PC memory", "lists' other upload buffers".to_owned(), alive[7], alive[6]),
+        ("PC memory", "windows' pages ever copied".to_owned(), window[0], 0),
+        ("PC memory", "descriptor views kept".to_owned(), views[2], views[0]),
+        ("PC memory", "shader containers".to_owned(), kept[1], kept[0]),
+        ("PC memory", "shader translations".to_owned(), kept[3], kept[2]),
+        ("PC memory", "pipeline library file".to_owned(), kept[4], 0),
+        ("PC memory", "our heap blocks under 4 KiB".to_owned(), own[0], own[4]),
+        ("PC memory", "our heap blocks to 64 KiB".to_owned(), own[1], own[5]),
+        ("PC memory", "our heap blocks to 1 MiB".to_owned(), own[2], own[6]),
+        ("PC memory", "our heap blocks larger".to_owned(), own[3], own[7]),
+        ("the PC", "free".to_owned(), free, 0),
+        ("the PC", "left to commit".to_owned(), left, 0),
+    ];
+    rows.retain(|r| r.2 > 0 || r.3 > 0);
+    rows
+}
+
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
 fn log_memory() {
