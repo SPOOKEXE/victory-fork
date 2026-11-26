@@ -2029,15 +2029,17 @@ struct MergeShared {
 }
 
 /// Whether [`Shadow::merge_wide`] merges a card copy's pages on the wide
-/// threads (`VICTORY_MERGE_WIDE`, on unless `0`; `alt`: twenty seconds
-/// with, twenty without, in turn, each change said in the log).
+/// threads (`VICTORY_MERGE_WIDE=1`; `alt`: twenty seconds with, twenty
+/// without, in turn, each change said in the log). Off by default: run AG,
+/// alternating, 17.1 ms a frame against 17.6 for the same 178 pages; the
+/// pages' compares are not what the merge's time is.
 fn merge_wide_on() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_MERGE_WIDE").as_deref() {
-        Ok("0") => 0,
+        Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 1,
+        _ => 0,
     }) {
         0 => false,
         1 => true,
@@ -3551,14 +3553,16 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = {
+            let _span = crate::trace::span("merge: the ranges shaders may write");
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|&&(a, e)| a < to && e > from)
+                .map(|&(a, e)| (a.max(from), e.min(to)))
+                .collect()
+        };
         if busy.is_empty() {
             return false;
         }
@@ -3589,6 +3593,7 @@ impl Shadow {
                 return true;
             };
             let stale: Vec<usize> = {
+                let _span = crate::trace::span("merge: the stale pages");
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
@@ -3607,7 +3612,10 @@ impl Shadow {
                 // reference under the same lock, and a page read before
                 // such a merge and compared after it would take the card's
                 // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let mut before = {
+                    let _span = crate::trace::span("merge: the reference's lock");
+                    self.before.lock().unwrap_or_else(|e| e.into_inner())
+                };
                 // A page that is not there is left as it is, and looked at
                 // again next time.
                 let read = {
