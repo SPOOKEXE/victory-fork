@@ -224,15 +224,15 @@ pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
 }
 
 /// Whether the program `hash` keeps the approximate forms ahead of the wide one:
-/// `VICTORY_WAVE_WIDE_HELD=<hash>,...` (none by default). For a program whose wide form
-/// misbehaves on a card; `ptfx_CS_lightAtlas_Sprite` and `_Trail` stopped the card in it
-/// until a skip over a loop that cannot end without lanes was kept
-/// ([`crate::ir::without_skips`]).
+/// `VICTORY_WAVE_WIDE_HELD=<hash>,...`; by default `CS_GatherDiffusion` (ce2378e5e8711aad,
+/// the skin's subsurface light), which put coloured specks on faces in it. Empty: none.
+/// (`ptfx_CS_lightAtlas_Sprite` and `_Trail` stopped the card in it until a skip over a
+/// loop that cannot end without lanes was kept, [`crate::ir::without_skips`].)
 pub fn wave_wide_held(hash: &str) -> bool {
     static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         std::env::var("VICTORY_WAVE_WIDE_HELD")
-            .unwrap_or_default()
+            .unwrap_or_else(|_| "ce2378e5e8711aad".to_owned())
             .split(',')
             .map(|h| h.trim().to_ascii_lowercase())
             .filter(|h| !h.is_empty())

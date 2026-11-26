@@ -838,7 +838,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_HOLD_SHADERS=<hash>,...` | never translate or run these 16-digit shader hashes, in every build; default `02384a60fda6f2d0` (the title's GPU heap defrag, whose moves left textures as coloured blocks); empty runs everything |
 | `VICTORY_SHADER_NAMES=<file>` | where every shader's hash, stage and HLSL name is listed once (default `shader-names.txt` beside the shader cache folder); search it for the shaders of a fault, then hold them with `VICTORY_HOLD_SHADERS` |
-| `VICTORY_WAVE_WIDE_HELD=<hash>,...` | wave64 programs that keep the approximate per-half form ahead of the exact two-half one (none by default) |
+| `VICTORY_WAVE_WIDE_HELD=<hash>,...` | wave64 programs that keep the approximate per-half form ahead of the exact two-half one (default `ce2378e5e8711aad`, `CS_GatherDiffusion`: specks on skin; empty: none) |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
