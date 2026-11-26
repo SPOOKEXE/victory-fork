@@ -1584,6 +1584,10 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Card memory the list copies constant buffers into on the card
+    /// ([`HostList::card_fill`]): the buffer, the bytes used since the
+    /// reset, and whether it has been read as constants since its last copy.
+    card_fills: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     /// Whether a barrier of the title's has passed since indirect arguments
     /// were last made readable (`crate::indirect::ready`).
@@ -2521,6 +2525,20 @@ const SPARE_MOST: u64 = 128 << 20;
 /// made theirs anew: some 57 upload buffers of 4 MiB made, zeroed and
 /// freed per frame of gameplay (run 60).
 /// `VICTORY_SCRATCH_POOL=0`: chunks of 4 MiB kept by their list, as before.
+/// Whether constant buffers that read where shaders write are copied on
+/// the card ([`HostList::card_fill`]; `VICTORY_CARD_FILLS=1`). Off by
+/// default: in the café it took the submitting thread's waits for flights
+/// from 20 to 60 ms a frame to under 15, but about 180 copies a frame, each
+/// between full barriers, and the card's time per frame went up (170 ms
+/// against 128 in runs O and P, scenes not quite alike); no faster frame.
+fn card_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILLS").is_some_and(|v| v == "1"))
+}
+
+/// Constant buffers copied on the card since the start ([`HostList::card_fill`]).
+pub(crate) static CARD_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn scratch_pool() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_POOL").is_none_or(|v| v != "0"))
@@ -3804,7 +3822,22 @@ mod fill_ahead {
     }
 
     /// The 64 KiB pieces shaders have changed in this run ([`Mode::Learn`]).
+    /// (By 4 KiB pages fewer fills waited, but the 2 KiB block shaders
+    /// write as the café flashback begins, the one behind the blurred oval,
+    /// was read ahead once: its page had not been written before.)
     static WRITTEN: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+    /// What [`WRITTEN`] is kept by.
+    const LEARNED: usize = PIECE;
+
+    /// Whether `len` bytes at `src` lie in a piece shaders have changed
+    /// this run ([`Mode::Learn`] only).
+    pub(crate) fn shaders_wrote(src: usize, len: usize) -> bool {
+        if mode() != Mode::Learn || len == 0 {
+            return false;
+        }
+        let written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        written.as_ref().is_some_and(|set| (src / LEARNED..=(src + len - 1) / LEARNED).any(|p| set.contains(&p)))
+    }
 
     /// Whether a read of title memory at `src` may go ahead of flights that
     /// may write it: [`on`], and with [`Mode::Learn`] not in a piece
@@ -3818,7 +3851,7 @@ mod fill_ahead {
         }
         let written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         let Some(set) = written.as_ref() else { return true };
-        !(src / PIECE..=(src + len - 1) / PIECE).any(|p| set.contains(&p))
+        !(src / LEARNED..=(src + len - 1) / LEARNED).any(|p| set.contains(&p))
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -3850,7 +3883,7 @@ mod fill_ahead {
         if mode() == Mode::Learn {
             let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
             let set = written.get_or_insert_with(HashSet::new);
-            set.extend(at / PIECE..=(at + new.len() - 1) / PIECE);
+            set.extend(at / LEARNED..=(at + new.len() - 1) / LEARNED);
         }
         if WAIT.load(Relaxed) {
             return;
@@ -3930,12 +3963,13 @@ mod fill_ahead {
             "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT={}): {:.1} per \
              frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
              bytes a flight then changed, since the start: {}{}; {kept} fills kept to check; {learned} pieces of 64 KiB shaders \
-             changed, where fills wait",
+             changed, where fills wait; {} constant buffers copied on the card instead, since the start",
             if mode() == Mode::Learn { "learn" } else { "0" },
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
-            if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
+            if WAIT.load(Relaxed) { " (fills wait again)" } else { "" },
+            super::CARD_FILLS.load(Relaxed)
         );
     }
 
@@ -3956,6 +3990,7 @@ mod fill_ahead {
 }
 
 pub(crate) use fill_ahead::wrote as shaders_write;
+pub(crate) use fill_ahead::shaders_wrote;
 
 /// Diagnostics: the fills of upload memory that made a submission wait for
 /// flights (`blocked_by`), which one they are, and whether the wait was
@@ -5265,6 +5300,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                card_fills: Mutex::default(),
                 arguments_stale: std::sync::atomic::AtomicBool::new(true),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
@@ -7817,6 +7853,9 @@ impl HostList {
             *self.shot_block.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, 0);
             *self.shot_mark.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
         }
+        if let Some(fills) = self.card_fills.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            (fills.1, fills.2) = (0, false);
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -8507,6 +8546,64 @@ impl HostList {
         let (gpu, to) = self.scratch(len)?;
         self.defer_fill(to, src, len as usize);
         self.deferred().filled.insert(key, gpu);
+        Some(gpu)
+    }
+
+    /// A constant buffer at `address` (`len` bytes, in `shadow`) the list
+    /// reads at an address not 256-byte aligned, copied on the card, here in
+    /// the list, into card memory of the list's own: its address there, or
+    /// none if [`card_fills`] is off (the default) or the list's room is used up.
+    ///
+    /// Why: such a buffer is otherwise copied by the CPU when the list is
+    /// submitted ([`HostList::defer_fill`]), and where shaders write those
+    /// bytes the submission first waits for every flight in the air to land
+    /// (`blocked_by`): 20 to 60 ms of the submitting thread a frame in the
+    /// café for one such fill. The card reads them in order instead, as the
+    /// console's does: after the work before them in the list and in the
+    /// queue. (The CPU's own changes reach the copy with the list's
+    /// refreshes, which run before it.)
+    pub(crate) fn card_fill(&self, shadow: &crate::shadow::Shadow, address: u64, len: u64) -> Option<u64> {
+        /// Room per list; more is left to the CPU's fill.
+        const ROOM: u64 = 4 << 20;
+        const VERTEX_AND_CONSTANT: i32 = 0x1;
+        const COPY_DEST: i32 = 0x400;
+        const COPY_SOURCE: i32 = 0x800;
+        if !card_fills() {
+            return None;
+        }
+        let mut fills = self.card_fills.lock().unwrap_or_else(|e| e.into_inner());
+        if fills.is_none() {
+            let buffer = host()?.uav_buffer(ROOM)?;
+            name(&buffer, || "list card fills".to_owned());
+            *fills = Some((buffer, 0, false));
+        }
+        let (buffer, used, read) = fills.as_mut()?;
+        let at = used.next_multiple_of(256);
+        if at + len > ROOM {
+            return None;
+        }
+        // SAFETY: live buffers; an open list. The copy's own memory moves
+        // from constant reads (or the common state, at the list's start) to
+        // a copy's destination and back; the title buffer's copy from the
+        // common state (every write before it in the queue made visible) to
+        // a copy's source and back.
+        let gpu = unsafe {
+            let from = shadow.gpu(address) - shadow.buffer.GetGPUVirtualAddress();
+            let state = |s: i32| D3D12_RESOURCE_STATES(s);
+            let was = if *read { VERTEX_AND_CONSTANT } else { 0 };
+            self.list.ResourceBarrier(&[
+                transition(&shadow.buffer, state(0), state(COPY_SOURCE)),
+                transition(buffer, state(was), state(COPY_DEST)),
+            ]);
+            self.list.CopyBufferRegion(&*buffer, at, &shadow.buffer, from, len);
+            self.list.ResourceBarrier(&[
+                transition(&shadow.buffer, state(COPY_SOURCE), state(0)),
+                transition(buffer, state(COPY_DEST), state(VERTEX_AND_CONSTANT)),
+            ]);
+            buffer.GetGPUVirtualAddress() + at
+        };
+        (*used, *read) = (at + len, true);
+        CARD_FILLS.fetch_add(1, Ordering::Relaxed);
         Some(gpu)
     }
 

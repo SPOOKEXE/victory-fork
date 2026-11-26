@@ -1064,6 +1064,13 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    // Where shaders write: copied on the card, in order (no wait for flights).
+    if crate::host::shaders_wrote(address as usize, len as usize)
+        && let Some(gpu) = list.card_fill(&shadow, address, len)
+    {
+        shadow.refresh(list, address, len);
+        return Some(gpu);
+    }
     if crate::host::list_reuse() {
         return list.fill_scratch(address as *const u8, len);
     }
@@ -3924,6 +3931,16 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Where shaders write: copied on the card, in order
+                        // (no wait for flights at submission).
+                        if crate::host::shaders_wrote(address as usize, size as usize)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && let Some(gpu) = list.card_fill(&shadow, address, u64::from(size))
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
