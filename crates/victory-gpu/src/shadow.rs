@@ -2018,6 +2018,44 @@ fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// What the jobs of [`Shadow::merge_wide`] share: the pages (page, from,
+/// to, the asking, whether whole), each page's asking once merged (0: not),
+/// the submission's changed runs left, and whether they ran out.
+struct MergeShared {
+    work: Vec<(usize, usize, usize, u64, bool)>,
+    done: Vec<std::sync::atomic::AtomicU64>,
+    left: std::sync::atomic::AtomicUsize,
+    gave_up: std::sync::atomic::AtomicBool,
+}
+
+/// Whether [`Shadow::merge_wide`] merges a card copy's pages on the wide
+/// threads (`VICTORY_MERGE_WIDE`, on unless `0`; `alt`: twenty seconds
+/// with, twenty without, in turn, each change said in the log).
+fn merge_wide_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_MERGE_WIDE").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a card copy's pages are merged under flights on the wide threads from now (VICTORY_MERGE_WIDE=alt): {}",
+                    if on { "ON" } else { "off, one after the other as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// The gap, in bytes, over which the title bytes put into a copy in the
 /// card's memory under flights' shader writes are joined into one run
 /// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
@@ -3529,6 +3567,11 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
+        // A copy in the card's memory with many pages to merge: on the wide
+        // threads, page by page ([`Shadow::merge_wide`]).
+        if self.card.is_some() && merge_wide_on() {
+            return self.merge_wide(&busy, base, runs_left);
+        }
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
@@ -3632,6 +3675,138 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// [`Shadow::merge_under_writes`] of `busy` for a copy in the card's
+    /// memory, its pages side by side on the wide threads (`wide_run`, this
+    /// thread among them). The ranges are asked about here, one after the
+    /// other, as before; then every stale page is read, compared with the
+    /// copy's CPU side and merged by a thread of its own, each page's bytes
+    /// and notes its own. The reference's lock is held by this thread for
+    /// the whole of it: the copy-back thread merges nothing into this copy
+    /// meanwhile, as page by page it did not between a page's read and its
+    /// merge.
+    ///
+    /// Why: in the café the merge was 12 to 14 ms of the submitting thread
+    /// a frame, 200 to 330 pages of 64 KiB, with the wide threads idle.
+    fn merge_wide(&self, busy: &[(usize, usize)], base: usize, runs_left: &mut usize) -> bool {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        // The pages to merge: (page, from, to, the asking, whether whole).
+        let mut work: Vec<(usize, usize, usize, u64, bool)> = Vec::new();
+        for &(a, e) in busy {
+            let asked = {
+                let _span = crate::trace::span("merge: what the title wrote");
+                crate::watch::writes(a, e, true)
+            };
+            let Some((now, written)) = asked else {
+                MERGE_GAVE_UP[1].fetch_add(1, Ordering::Relaxed);
+                return true;
+            };
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for page in stale_pages_in(base, &copied, a, e, &written) {
+                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                if lo < hi {
+                    let whole = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
+                    work.push((page, lo, hi, now, whole));
+                }
+            }
+        }
+        if work.is_empty() {
+            return false;
+        }
+        let _span = crate::trace::span("merge: pages side by side");
+        let _before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = std::sync::Arc::new(MergeShared {
+            done: work.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            work,
+            left: AtomicUsize::new(*runs_left),
+            gave_up: AtomicBool::new(false),
+        });
+        // About eight pages to a piece of work.
+        const PIECE: usize = 8;
+        let n = shared.work.len();
+        if n <= PIECE {
+            let mut title = Vec::new();
+            for i in 0..n {
+                self.merge_page(&shared, i, &mut title);
+            }
+        } else {
+            // (`wide_run` returns when every piece is done: the copy outlives the jobs)
+            let me = self as *const Shadow as usize;
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..n)
+                .step_by(PIECE)
+                .map(|first| {
+                    let shared = shared.clone();
+                    Box::new(move || {
+                        let _span = crate::trace::span("merge: a piece of pages");
+                        // SAFETY: see above.
+                        let me = unsafe { &*(me as *const Shadow) };
+                        let mut title = Vec::new();
+                        for i in first..(first + PIECE).min(shared.work.len()) {
+                            me.merge_page(&shared, i, &mut title);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            wide_run(jobs);
+        }
+        let (work, done, left, gave_up) = (&shared.work, &shared.done, &shared.left, &shared.gave_up);
+        *runs_left = left.load(Ordering::Relaxed);
+        // Pages merged whole are taken at their asking; the others are the
+        // refresh's (it notes whole pages only) and looked at again.
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, &(page, _, _, _, whole)) in work.iter().enumerate() {
+                let now = done[i].load(Ordering::Relaxed);
+                if whole && now != 0
+                    && let Some(at) = copied.get_mut(page - base)
+                {
+                    *at = now;
+                }
+            }
+        }
+        if gave_up.load(Ordering::Relaxed) {
+            MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// One page of [`Shadow::merge_wide`]: page `i` of `shared`'s work read
+    /// into `title`, compared with the copy's CPU side, its changed runs put
+    /// in and noted for the card. Nothing if the submission's runs ran out
+    /// (then `gave_up`), or the page is not there.
+    fn merge_page(&self, shared: &MergeShared, i: usize, title: &mut Vec<u8>) {
+        if shared.gave_up.load(Ordering::Relaxed) {
+            return;
+        }
+        let (_, lo, hi, now, _) = shared.work[i];
+        let n = hi - lo;
+        title.resize(n, 0);
+        if !crate::host::read_into(lo as *const u8, &mut title[..n]) {
+            return;
+        }
+        MERGED[0].fetch_add(1, Ordering::Relaxed);
+        let at = lo - self.start as usize;
+        // SAFETY: inside the mapping of the copy's CPU side, which only the
+        // submitting thread's merge writes now; each page is one job's alone.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        let runs = joined_over(changed_runs(&title[..n], held), merge_gap());
+        // The runs left for the submission: taken for this page, or none.
+        if shared.left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| l.checked_sub(runs.len())).is_err() {
+            shared.gave_up.store(true, Ordering::Relaxed);
+            return;
+        }
+        let mut bytes = 0;
+        for &(r, m) in &runs {
+            held[r..r + m].copy_from_slice(&title[r..r + m]);
+            bytes += m;
+        }
+        self.card_changed_runs(at, &runs);
+        MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+        MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
+        shared.done[i].store(now.max(1), Ordering::Relaxed);
     }
 
     /// At submission: copies what changed of `[address, address + len)`
