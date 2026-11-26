@@ -2541,8 +2541,8 @@ fn card_fills() -> bool {
 pub(crate) static CARD_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Title buffer copies left to the CPU by [`HostList::card_copy`], since the
 /// start: the source where shaders have not written, no host copy of one
-/// side, the destination's copy not in the card's memory, a side not whole
-/// in its copy (or both in one).
+/// side, the destination's copy in place (title memory itself), a side not
+/// whole in its copy (or both in one).
 pub(crate) static CARD_COPIES_REFUSED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Constant buffers copied on the card since the start ([`HostList::card_fill`]).
@@ -8729,19 +8729,25 @@ impl HostList {
         if !card_fills() || len == 0 {
             return false;
         }
-        if !shaders_wrote(src, len) {
-            return refused(0);
-        }
         let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len as u64), crate::shadow::find(dst as u64, len as u64)) else {
             return refused(1);
         };
-        // Both whole inside their copies, and the destination's copy in the
-        // card's memory (one the copy-back brings home).
-        if !to.carded() {
-            return refused(2);
+        // Where shaders have changed the source this run, or a flight in
+        // the air may be writing it now (what makes the CPU's copy wait;
+        // a source first written by a flight is not learned before it
+        // lands).
+        if !shaders_wrote(src, len) && !from.writes_pending_over(src, len) {
+            return refused(0);
         }
+        // Both whole inside their copies, not one copy. (The destination's
+        // copy in the card's memory or in PC memory shared with the card:
+        // both can take a copy, and the copy-back finds what changed in
+        // either.)
         if from.left(src as u64) < len as u64 || to.left(dst as u64) < len as u64 || std::sync::Arc::ptr_eq(&from, &to) {
             return refused(3);
+        }
+        if to.in_place() {
+            return refused(2);
         }
         // The source's CPU-side changes first, as for any read of it.
         from.refresh(self, src as u64, len as u64);

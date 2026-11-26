@@ -3443,6 +3443,13 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Whether shaders of a submission not yet copied back may be writing
+    /// some of `[address, address + len)` (title addresses).
+    pub(crate) fn writes_pending_over(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < end && address < e)
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the
@@ -3935,6 +3942,11 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether the copy is no copy: a buffer placed on title memory itself.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
     }
 
     /// [`Shadow::card_changed`] for each of `runs` (offset from `at`,
