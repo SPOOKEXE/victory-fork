@@ -264,11 +264,11 @@ pub fn wave_wide_flags() -> u8 {
 }
 
 /// Whether the form with the halves meeting inside branches is tried before the
-/// approximate forms: by default (`VICTORY_WAVE_WIDE` unset or `1`) unless the program is
-/// held back ([`wave_wide_held`]), or for a program on `VICTORY_WAVE_WIDE_ONLY`'s list; not
-/// with `VICTORY_WAVE_WIDE=last` or `0`.
+/// approximate forms: with `VICTORY_WAVE_WIDE=1` unless the program is held back
+/// ([`wave_wide_held`]), or for a program on `VICTORY_WAVE_WIDE_ONLY`'s list. By default it
+/// comes after them, for what they leave at 64 lanes ([`translate`]'s `wide_last`).
 fn wave_wide_here() -> bool {
-    WIDE_HERE.get() || !WIDE_HELD.get() && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v == "1")
+    WIDE_HERE.get() || !WIDE_HELD.get() && std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -497,17 +497,15 @@ pub fn emit(
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
         // Each host wave as a wave of its own (`lower::with_local_waves`), for programs
-        // still stopped where not every lane runs: by default only for programs held from
-        // the wide form ([`wave_wide_held`]). The batch culls (`CS_Tree_BatchCull`,
-        // `CS_Prop_BatchCull`) in it gave out-of-range list indices: the card faulted in
-        // them and in the draws of their lists (the first boat cutscene, Xid 13), and ran
-        // clean through it once the wide form took them. `VICTORY_WAVE_LOCAL=1`: for every
-        // program, as before; `=0`: for none.
-        let local_on = match std::env::var("VICTORY_WAVE_LOCAL").ok().as_deref() {
-            Some("1") => true,
-            Some("0") => false,
-            _ => WIDE_HELD.get(),
-        };
+        // still stopped where not every lane runs. By default not for programs of the
+        // allocation idiom (`lower::wave_local`): the batch culls (`CS_Tree_BatchCull`,
+        // `CS_Prop_BatchCull`) in it gave out-of-range list indices (the idiom's check
+        // does not follow where a count goes), the card faulting in them and in the draws
+        // of their lists (Xid 13 in the first boat cutscene); they take the wide form
+        // ([`widen`]). The others keep the approximate forms, ahead of the wide one: in
+        // that one the lighting programs put coloured specks on skin.
+        // `VICTORY_WAVE_LOCAL=1`: for every program; `=0`: for none.
+        let local_mode = std::env::var("VICTORY_WAVE_LOCAL").ok();
         // Where the wave operations are the allocation idiom
         // ([`lower::wave_local`]) that is exact. Other programs are taken
         // the same way last of all, each half-wave giving its own results
@@ -522,6 +520,11 @@ pub fn emit(
                 }
                 false
             }
+        };
+        let local_on = match local_mode.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => WIDE_HELD.get() || !idiom(p, st),
         };
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
@@ -546,19 +549,15 @@ pub fn emit(
                 }
             }
         }
-        // Before the approximate forms by default ([`wave_wide_here`]): exact where they give
-        // each half its own answer (lighting, shadow and reflection programs came out wrong
-        // in those). Its halves meet on their own ([`lower::pair_meet_on`]), so halves that
-        // meet unevenly cannot hang the card (runs 121-124 lost it with this form in
-        // `ptfx_CS_lightAtlas_Sprite` and `_Trail` when the halves met at group barriers).
+        // Before the approximate forms only when asked for ([`wave_wide_here`]). Its halves
+        // meet on their own ([`lower::pair_meet_on`]), so halves that meet unevenly cannot
+        // hang the card (runs 121-124 lost it with this form in `ptfx_CS_lightAtlas_Sprite`
+        // and `_Trail` when the halves met at group barriers).
         let wide_on = wave_wide_here();
-        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
-        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
-        // the programs the approximate forms take keep their barrier-free form.
-        // `VICTORY_WAVE_WIDE=0`: never.
-        let wide_last = !wide_on
-            && (WIDE_HELD.get() && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0")
-                || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last"));
+        // By default the same form after them, for programs every other form leaves at 64
+        // lanes (on a 32-lane host those are refused outright): the idiom programs, which
+        // take no local form. `VICTORY_WAVE_WIDE=0`: never.
+        let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
