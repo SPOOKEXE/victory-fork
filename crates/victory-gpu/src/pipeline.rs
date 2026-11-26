@@ -101,6 +101,54 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Shaders' names as the title's compiler left them in the container, by hash
+/// ([`label_of`]), for the overlay and the reports.
+static LABELS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// The name the title's shader compiler left in `container`: the first run of name
+/// characters that ends in `_Wrapped`, without that ending and the 8-digit hash before it
+/// (`CS_ScreenProbes_EvaluateRayRequests_RayBinning_19e9e6fd_Wrapped` gives
+/// `CS_ScreenProbes_EvaluateRayRequests_RayBinning`).
+fn label_of(container: &[u8]) -> Option<String> {
+    const END: &[u8] = b"_Wrapped";
+    let at = container.windows(END.len()).position(|w| w == END)?;
+    let name_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+    let start = container[..at].iter().rposition(|&b| !name_char(b)).map_or(0, |i| i + 1);
+    let name = std::str::from_utf8(&container[start..at]).ok()?;
+    // (the compiler's hash of the source before `_Wrapped`)
+    let name = match name.rsplit_once('_') {
+        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_hexdigit()) => head,
+        _ => name,
+    };
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The name of the shader with the 16-digit `hash`, if its container has one.
+pub(crate) fn label(hash: &str) -> Option<String> {
+    LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(hash).cloned()
+}
+
+/// `text` with the name of every shader hash in it ([`label`]) after the hash.
+pub(crate) fn labelled(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(|c: char| c.is_ascii_hexdigit()) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let len = rest.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(len);
+        out.push_str(word);
+        if len == 16 && let Some(name) = label(word) {
+            out.push_str(" (");
+            out.push_str(&name);
+            out.push(')');
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -111,9 +159,13 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let hash = full.to_hex()[..16].to_owned();
+            if let Some(name) = label_of(bytes) {
+                LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(hash.clone(), name);
+            }
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                hash,
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
@@ -999,5 +1051,17 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    #[test]
+    fn a_shader_is_named_by_its_compilers_name_without_the_hash_and_ending() {
+        let mut container = b"\x00\x01DXIL..".to_vec();
+        container.extend_from_slice(b"\x00CS_ScreenProbes_EvaluateRayRequests_RayBinning_19e9e6fd_Wrapped\x00more");
+        assert_eq!(super::label_of(&container).as_deref(), Some("CS_ScreenProbes_EvaluateRayRequests_RayBinning"));
+        assert_eq!(super::label_of(b"\x00ptfx_VS_Wrapped").as_deref(), Some("ptfx_VS"));
+        assert_eq!(super::label_of(b"no name here"), None);
     }
 }

@@ -3722,7 +3722,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
                     .replace("BY_FLOATS_OR_NOT", "main")
                     .replace("#ifdef BY_FLOATS", "#if 0")
             };
-            let code = crate::host::compile(
+            let code = crate::hlsl::compile(
                 &source,
                 windows::core::s!("main"),
                 windows::core::s!("cs_5_1"),

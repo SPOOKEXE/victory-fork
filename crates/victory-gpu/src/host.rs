@@ -1419,7 +1419,7 @@ fn crumbs_report(what: &str) {
     {
         let kept = CRUMB_KEPT.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, notes, pipelines)) = kept.iter().rev().find(|k| k.0 == begun_id) {
-            tracing::error!("breadcrumbs: recording {begun_id} (kept when it closed), its pipelines: {pipelines:?}");
+            tracing::error!("breadcrumbs: recording {begun_id} (kept when it closed), its pipelines: {}", crate::pipeline::labelled(&format!("{pipelines:?}")));
             let done = if done_id == begun_id { done & 0xffff } else { 0 };
             crumbs_print(notes, done);
             return;
@@ -1433,7 +1433,7 @@ fn crumbs_report(what: &str) {
         return;
     };
     let pipelines = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    tracing::error!("breadcrumbs: recording {begun_id}, its pipelines: {pipelines:?}");
+    tracing::error!("breadcrumbs: recording {begun_id}, its pipelines: {}", crate::pipeline::labelled(&format!("{pipelines:?}")));
     let notes = list.notes.lock().unwrap_or_else(|e| e.into_inner());
     let (begun, done) = (begun & 0xffff, if done_id == begun_id { done & 0xffff } else { 0 });
     if begun == 0xfffe {
@@ -6518,7 +6518,7 @@ impl Host {
                                     .map(|at| &*(at as *const HostList));
                                 if let Some(other) = other {
                                     let pipelines = other.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                    tracing::error!("breadcrumbs: the list is another path's; its pipelines: {pipelines:?}");
+                                    tracing::error!("breadcrumbs: the list is another path's; its pipelines: {}", crate::pipeline::labelled(&format!("{pipelines:?}")));
                                 }
                                 if let Some(list) = list.or(other) {
                                     let notes = list.notes.lock().unwrap_or_else(|e| e.into_inner());

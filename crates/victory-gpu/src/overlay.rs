@@ -83,6 +83,39 @@ pub fn shown() -> bool {
     SHOWN.load(Relaxed)
 }
 
+/// A card-view row's text for the pipeline the card meter names `name` (its shaders as
+/// `[stage hash, ...]`): the shaders' own names where their containers have them
+/// (`crate::pipeline::label`, the compute or mesh one first), then the first hash's first
+/// six digits to tell variants apart; at most `NAME_CHARS` characters.
+fn pipeline_text(name: &str) -> String {
+    const NAME_CHARS: usize = 37;
+    let inner = name.trim_matches(|c| c == '[' || c == ']');
+    let mut names = Vec::new();
+    let mut first_hash = None;
+    for part in inner.split(", ") {
+        let Some((stage, hash)) = part.split_once(' ') else { continue };
+        first_hash.get_or_insert(hash);
+        match crate::pipeline::label(hash) {
+            // (the stage is in the name already: CS_, PS_, MS_ ...)
+            Some(label) => names.push(label),
+            None => names.push(format!("{stage} {hash}")),
+        }
+    }
+    if names.is_empty() {
+        return inner.to_uppercase();
+    }
+    let mut text = names.join("+");
+    if let Some(hash) = first_hash {
+        let short: String = hash.chars().take(6).collect();
+        let room = NAME_CHARS.saturating_sub(short.len() + 1);
+        if text.chars().count() > room {
+            text = text.chars().take(room).collect();
+        }
+        text = format!("{text} {short}");
+    }
+    text.to_uppercase()
+}
+
 /// Whether the card's view (F10) is up: the card meter then times every
 /// pipeline (`crate::cardmeter::pipelines`).
 pub(crate) fn gpu_shown() -> bool {
@@ -331,7 +364,7 @@ pub(crate) fn draw() -> Vec<u32> {
         let all: f64 = s.gpu_rows.iter().map(|r| r.1).sum();
         lines.push((format!("ALL PIPELINES {all:.1} MS"), None));
         for (name, ms, count) in &s.gpu_rows {
-            lines.push((name.trim_matches(|c| c == '[' || c == ']').to_uppercase(), Some((*ms, *count, frame))));
+            lines.push((pipeline_text(name), Some((*ms, *count, frame))));
         }
         if s.gpu_rows.is_empty() {
             lines.push(("(THE CARD'S TIMES ARRIVE A SECOND AND A HALF LATE)".to_owned(), None));
@@ -353,7 +386,9 @@ pub(crate) fn draw() -> Vec<u32> {
     }
     let first = (SCROLL.load(Relaxed) as usize).min(lines.len().saturating_sub(ROWS));
     SCROLL.store(first as u32, Relaxed);
-    let (bar_x, bar_w) = (150u32, WIDTH - 150 - 104);
+    // (the card's view: wider names, the shaders' own)
+    let names = if view == 1 { 228 } else { 150 };
+    let (bar_x, bar_w) = (names, WIDTH - names - 104);
     let mut y = 32;
     for (label, value) in lines.iter().skip(first).take(ROWS) {
         match value {
@@ -468,6 +503,8 @@ fn glyph(c: char) -> [u8; 7] {
         ')' => [8, 4, 2, 2, 2, 4, 8],
         ':' => [0, 12, 12, 0, 12, 12, 0],
         '%' => [24, 25, 2, 4, 8, 19, 3],
+        '_' => [0, 0, 0, 0, 0, 0, 31],
+        '+' => [0, 4, 4, 31, 4, 4, 0],
         _ => [0; 7],
     }
 }
