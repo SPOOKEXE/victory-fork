@@ -22,8 +22,22 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// The file shaders' names go into ([`names_file`]).
+static NAMES: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where every shader's hash, stage and name is listed once
+/// (`crate::pipeline`'s names, to search for the shaders of a fault by what they draw):
+/// `VICTORY_SHADER_NAMES=<file>`, else `shader-names.txt` beside the shader cache's folder.
+pub(crate) fn names_file() -> Option<&'static PathBuf> {
+    NAMES.get()
+}
+
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    let names = std::env::var_os("VICTORY_SHADER_NAMES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.parent().unwrap_or(&dir).join("shader-names.txt"));
+    let _ = NAMES.set(names);
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);

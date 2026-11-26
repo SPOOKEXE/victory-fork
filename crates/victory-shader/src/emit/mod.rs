@@ -203,15 +203,15 @@ pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
 }
 
 /// Whether the program `hash` keeps the approximate forms ahead of the wide one:
-/// `VICTORY_WAVE_WIDE_HELD=<hash>,...`, by default the programs whose wide form stopped the
-/// card (Xid 109 a few seconds after their first dispatch, 2026-11-26):
-/// `ptfx_CS_lightAtlas_Sprite` and `_Trail` (also runs 121-124) and
-/// `CS_EntityFireResolve_Scalarized`. Empty: none.
+/// `VICTORY_WAVE_WIDE_HELD=<hash>,...` (none by default). For a program whose wide form
+/// misbehaves on a card; `ptfx_CS_lightAtlas_Sprite` and `_Trail` stopped the card in it
+/// until a skip over a loop that cannot end without lanes was kept
+/// ([`crate::ir::without_skips`]).
 pub fn wave_wide_held(hash: &str) -> bool {
     static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         std::env::var("VICTORY_WAVE_WIDE_HELD")
-            .unwrap_or_else(|_| "2561af9577c47289,c06aa62112ffba4c,2e92491c2ae5472b".to_owned())
+            .unwrap_or_default()
             .split(',')
             .map(|h| h.trim().to_ascii_lowercase())
             .filter(|h| !h.is_empty())

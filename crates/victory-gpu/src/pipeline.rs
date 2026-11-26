@@ -123,6 +123,27 @@ fn label_of(container: &[u8]) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+/// Adds `hash stage name` to the names file (`crate::shader_cache::names_file`) unless a
+/// run before has: the hashes listed there are read once.
+fn write_name(hash: &str, stage: &str, name: &str) {
+    use std::io::Write;
+    static LISTED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let Some(file) = crate::shader_cache::names_file() else { return };
+    let mut listed = LISTED.lock().unwrap_or_else(|e| e.into_inner());
+    let listed = listed.get_or_insert_with(|| {
+        std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
+            .collect()
+    });
+    if !listed.insert(hash.to_owned()) {
+        return;
+    }
+    let line = format!("{hash} {stage} {name}\n");
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open(file).and_then(|mut f| f.write_all(line.as_bytes()));
+}
+
 /// The name of the shader with the 16-digit `hash`, if its container has one.
 pub(crate) fn label(hash: &str) -> Option<String> {
     LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(hash).cloned()
@@ -161,6 +182,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let hash = full.to_hex()[..16].to_owned();
             if let Some(name) = label_of(bytes) {
+                write_name(&hash, stage, &name);
                 LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(hash.clone(), name);
             }
             Arc::new(Shader {
