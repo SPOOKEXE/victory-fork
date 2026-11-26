@@ -189,6 +189,11 @@ default VICTORY_FILL_WAIT learn
 # title memory, where the CPU floats boats on them (without it the first boat
 # sinks, its engine is destroyed and the hull cuts a pit in the water).
 default VICTORY_TEXTURE_BACK 1
+# Writes into title memory open the guarded blocks under them, and nothing
+# more (upstream's default since 2026-11-26 also makes the textures picked
+# by index under them due again: with it two of three 20-minute runs here
+# lost the card within five minutes, with this neither of two).
+default VICTORY_PAGE_WRITES guards
 
 stamp=$(date +%Y%m%d-%H%M%S)
 since=$(date '+%Y-%m-%d %H:%M:%S')
