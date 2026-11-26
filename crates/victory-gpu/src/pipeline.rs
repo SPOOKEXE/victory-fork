@@ -166,7 +166,10 @@ impl Shader {
                 let done = if held(&self.hash) {
                     Err("held back (VICTORY_HOLD_SHADERS)".to_owned())
                 } else {
-                    victory_shader::emit::with_wave_wide(wide, || translate(&self.container))
+                    let held = victory_shader::emit::wave_wide_held(&self.hash);
+                    victory_shader::emit::with_wave_wide_held(held, || {
+                        victory_shader::emit::with_wave_wide(wide, || translate(&self.container))
+                    })
                 };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with

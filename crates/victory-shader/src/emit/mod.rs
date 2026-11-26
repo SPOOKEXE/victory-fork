@@ -194,7 +194,7 @@ pub fn wave_wide_listed(hash: &str) -> bool {
 }
 
 /// Runs `f` (a translation) with the wide form allowed on this thread or
-/// not ([`wave_wide_listed`]).
+/// not ([`wave_wide_listed`]), and kept back or not ([`wave_wide_held`]).
 pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
     let was = WIDE_HERE.replace(on);
     let out = f();
@@ -202,11 +202,45 @@ pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// Whether the program `hash` keeps the approximate forms ahead of the wide one:
+/// `VICTORY_WAVE_WIDE_HELD=<hash>,...`, by default the programs whose wide form stopped the
+/// card (Xid 109 a few seconds after their first dispatch, 2026-11-26):
+/// `ptfx_CS_lightAtlas_Sprite` and `_Trail` (also runs 121-124) and
+/// `CS_EntityFireResolve_Scalarized`. Empty: none.
+pub fn wave_wide_held(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_HELD")
+            .unwrap_or_else(|_| "2561af9577c47289,c06aa62112ffba4c,2e92491c2ae5472b".to_owned())
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .iter()
+    .any(|h| h == hash)
+}
+
+thread_local! {
+    /// The program being translated on this thread is on [`wave_wide_held`]'s list.
+    static WIDE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the program kept to the old order or not
+/// ([`wave_wide_held`]).
+pub fn with_wave_wide_held<R>(held: bool, f: impl FnOnce() -> R) -> R {
+    let was = WIDE_HELD.replace(held);
+    let out = f();
+    WIDE_HELD.set(was);
+    out
+}
+
 /// Whether the form with the halves meeting inside branches is tried before the
-/// approximate forms: by default (`VICTORY_WAVE_WIDE` unset or `1`), or for a program on
-/// `VICTORY_WAVE_WIDE_ONLY`'s list; not with `VICTORY_WAVE_WIDE=last` or `0`.
+/// approximate forms: by default (`VICTORY_WAVE_WIDE` unset or `1`) unless the program is
+/// held back ([`wave_wide_held`]), or for a program on `VICTORY_WAVE_WIDE_ONLY`'s list; not
+/// with `VICTORY_WAVE_WIDE=last` or `0`.
 fn wave_wide_here() -> bool {
-    WIDE_HERE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v == "1")
+    WIDE_HERE.get() || !WIDE_HELD.get() && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v == "1")
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -485,7 +519,9 @@ pub fn emit(
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the approximate forms take keep their barrier-free form.
         // `VICTORY_WAVE_WIDE=0`: never.
-        let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
+        let wide_last = !wide_on
+            && (WIDE_HELD.get() && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0")
+                || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last"));
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
