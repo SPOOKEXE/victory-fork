@@ -340,6 +340,166 @@ fn big_blocks() -> String {
     if text.is_empty() { "none".into() } else { text.join(", ") }
 }
 
+/// Where our blocks come from, sampled (`VICTORY_ALLOC_SITES=1`; off
+/// by default): one allocation in [`SITE_EVERY`] is taken with the return
+/// addresses of its caller's stack, and counted against that place until
+/// it is released. The memory line then names the places holding the most
+/// sampled bytes alive, as `exe+offset` (`addr2line -e victory.exe`), to
+/// find what keeps growing (about a gigabyte a minute of private memory,
+/// most of it in our blocks under 64 KiB). No allocation is made here:
+/// fixed tables, slots taken by compare-and-swap.
+mod sites {
+    use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+    pub(super) const SITE_EVERY: u64 = 509;
+    const SITES: usize = 4096;
+    const FRAMES: usize = 12;
+    const SAMPLED: usize = 1 << 17;
+    const PROBE: usize = 32;
+
+    static ON: AtomicU32 = AtomicU32::new(2);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static SITE_HASH: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+    static SITE_FRAMES: [[AtomicUsize; FRAMES]; SITES] = [const { [const { AtomicUsize::new(0) }; FRAMES] }; SITES];
+    static SITE_BYTES: [AtomicI64; SITES] = [const { AtomicI64::new(0) }; SITES];
+    static SITE_BLOCKS: [AtomicI64; SITES] = [const { AtomicI64::new(0) }; SITES];
+    static AT: [AtomicUsize; SAMPLED] = [const { AtomicUsize::new(0) }; SAMPLED];
+    static SITE_OF: [AtomicU32; SAMPLED] = [const { AtomicU32::new(0) }; SAMPLED];
+    static SIZE_OF: [AtomicU64; SAMPLED] = [const { AtomicU64::new(0) }; SAMPLED];
+
+    std::thread_local! {
+        static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn on() -> bool {
+        match ON.load(Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                // (read once; the environment lookup allocates, so not while inside)
+                let on = INSIDE.with(|i| {
+                    if i.replace(true) {
+                        return None;
+                    }
+                    let on = std::env::var_os("VICTORY_ALLOC_SITES").is_some_and(|v| v == "1");
+                    i.set(false);
+                    Some(on)
+                });
+                match on {
+                    Some(on) => {
+                        ON.store(u32::from(on), Relaxed);
+                        on
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    fn slot(at: usize) -> usize {
+        (at >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 47
+    }
+
+    pub(super) fn made(at: *mut u8, size: usize) {
+        if !COUNT.fetch_add(1, Relaxed).is_multiple_of(SITE_EVERY) || !on() {
+            return;
+        }
+        let entered = INSIDE.try_with(|i| !i.replace(true)).unwrap_or(false);
+        if !entered {
+            return;
+        }
+        let mut frames = [std::ptr::null_mut::<core::ffi::c_void>(); FRAMES];
+        // SAFETY: a buffer of FRAMES pointers.
+        let n = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(3, FRAMES as u32, frames.as_mut_ptr(), std::ptr::null_mut())
+        } as usize;
+        let hash = frames[..n].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &f| (h ^ f as u64).wrapping_mul(0x100_0000_01b3)) | 1;
+        let mut site = usize::MAX;
+        for k in 0..64 {
+            let i = (hash as usize + k) % SITES;
+            match SITE_HASH[i].compare_exchange(0, hash, Relaxed, Relaxed) {
+                Ok(_) => {
+                    for (f, at) in SITE_FRAMES[i].iter().zip(&frames[..n]) {
+                        f.store(*at as usize, Relaxed);
+                    }
+                    site = i;
+                    break;
+                }
+                Err(h) if h == hash => {
+                    site = i;
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        if site != usize::MAX {
+            let s0 = slot(at as usize);
+            for k in 0..PROBE {
+                let i = (s0 + k) % SAMPLED;
+                if AT[i].compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok() {
+                    SITE_OF[i].store(site as u32, Relaxed);
+                    SIZE_OF[i].store(size as u64, Relaxed);
+                    SITE_BYTES[site].fetch_add(size as i64, Relaxed);
+                    SITE_BLOCKS[site].fetch_add(1, Relaxed);
+                    break;
+                }
+            }
+        }
+        let _ = INSIDE.try_with(|i| i.set(false));
+    }
+
+    pub(super) fn released(at: *mut u8) {
+        if ON.load(Relaxed) != 1 {
+            return;
+        }
+        let s0 = slot(at as usize);
+        for k in 0..PROBE {
+            let i = (s0 + k) % SAMPLED;
+            if AT[i].load(Relaxed) == at as usize {
+                let (site, size) = (SITE_OF[i].load(Relaxed) as usize, SIZE_OF[i].load(Relaxed));
+                if AT[i].compare_exchange(at as usize, 0, Relaxed, Relaxed).is_ok() {
+                    SITE_BYTES[site].fetch_sub(size as i64, Relaxed);
+                    SITE_BLOCKS[site].fetch_sub(1, Relaxed);
+                }
+                return;
+            }
+        }
+    }
+
+    /// The places holding the most sampled bytes alive (estimated: times
+    /// [`SITE_EVERY`]), with their return addresses as `exe+offset`.
+    pub(super) fn report() -> Vec<String> {
+        if ON.load(Relaxed) != 1 {
+            return Vec::new();
+        }
+        // SAFETY: a plain query of our own module.
+        let base = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) } as usize;
+        let mut rows: Vec<(i64, i64, usize)> =
+            (0..SITES).map(|i| (SITE_BYTES[i].load(Relaxed), SITE_BLOCKS[i].load(Relaxed), i)).filter(|r| r.0 > 0).collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+        rows.into_iter()
+            .take(12)
+            .map(|(bytes, blocks, i)| {
+                let frames: Vec<String> = SITE_FRAMES[i]
+                    .iter()
+                    .map(|f| f.load(Relaxed))
+                    .filter(|&f| f != 0)
+                    .map(|f| match f.checked_sub(base) {
+                        Some(o) if o < 1 << 30 => format!("exe+{o:#x}"),
+                        _ => format!("{f:#x}"),
+                    })
+                    .collect();
+                format!(
+                    "{:.1} MB in {} blocks (estimated): {}",
+                    (bytes as u64 * SITE_EVERY) as f64 / f64::from(1u32 << 20),
+                    blocks as u64 * SITE_EVERY,
+                    frames.join(" ")
+                )
+            })
+            .collect()
+    }
+}
+
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
 struct Counting;
@@ -353,6 +513,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            sites::made(at, layout.size());
         }
         at
     }
@@ -363,6 +524,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            sites::made(at, layout.size());
         }
         at
     }
@@ -370,6 +532,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn dealloc(&self, at: *mut u8, layout: std::alloc::Layout) {
         own(layout.size(), false);
         big(at, layout.size(), false);
+        sites::released(at);
         // SAFETY: the caller's contract, passed on.
         unsafe { std::alloc::System.dealloc(at, layout) };
     }
@@ -378,6 +541,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         // SAFETY: the caller's contract, passed on.
         let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
         if !moved.is_null() {
+            sites::released(at);
+            sites::made(moved, size);
             own(layout.size(), false);
             own(size, true);
             big(at, layout.size(), false);
@@ -1390,6 +1555,9 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
     log_memory();
+    for row in sites::report() {
+        tracing::info!("  our blocks alive by where they were made (VICTORY_ALLOC_SITES=1): {row}");
+    }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
