@@ -6983,6 +6983,7 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
+            let _span = crate::trace::span("submit: one write-watch asking for all");
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
@@ -7019,13 +7020,18 @@ impl Host {
             for list in runs {
                 list.run_deferred(&mut batch);
                 firsts.push(lists.len());
-                if let Some(prelude) = list.prelude() {
+                let prelude = {
+                    let _span = crate::trace::span("copies: a list's prelude");
+                    list.prelude()
+                };
+                if let Some(prelude) = prelude {
                     lists.push(Some(prelude));
                 }
                 lists.push(list.list.cast().ok());
             }
             part = prep_part(1, part);
             batch.flush_fills();
+            let _flush = crate::trace::span("copies: the last flush");
             batch.flush();
         }
         crate::watch::ask_once_end();
@@ -9007,6 +9013,7 @@ impl HostList {
             let started = crate::clock::now_us();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
+                    let _span = crate::trace::span("step: title buffer copy");
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -9074,10 +9081,14 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
+                    let _span = crate::trace::span("step: a range shaders write");
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
+                    {
+                        let _span = crate::trace::span("step: its snapshot");
+                        shadow.writing(*address, *len);
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
@@ -9440,6 +9451,7 @@ impl Batch {
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
         self.flush_fills();
+        let _span = crate::trace::span("refreshes before a title copy");
         self.flush();
         self.textures.clear();
         let end = at + len;

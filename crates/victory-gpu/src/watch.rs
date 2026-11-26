@@ -506,7 +506,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// the journal.
 fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let answer = || PAGES_WRITTEN.collect(first, last);
+    let answer = || {
+        let _span = crate::trace::span("watch: pages written, from the journal");
+        PAGES_WRITTEN.collect(first, last)
+    };
     {
         let mut j = contended(&JOURNAL, "journal lock wait");
         // An asking of other threads over this memory puts what it found
@@ -579,6 +582,7 @@ fn ask(first: usize, last: usize, guarded: bool) -> Option<(Vec<usize>, bool)> {
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
+    let kernel = (!known_view).then(|| crate::trace::span("watch: the kernel's write watch")).flatten();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -591,6 +595,7 @@ fn ask(first: usize, last: usize, guarded: bool) -> Option<(Vec<usize>, bool)> {
                 &mut granularity,
             )
         } != 0;
+    drop(kernel);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
@@ -611,7 +616,10 @@ fn ask(first: usize, last: usize, guarded: bool) -> Option<(Vec<usize>, bool)> {
         }
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        let written = {
+            let _span = crate::trace::span("watch: the guards' walk");
+            guard(first * PAGE, last * PAGE)
+        };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         written?

@@ -211,7 +211,10 @@ pub(crate) fn sync_heaps() {
             end as usize
         };
         let asking = std::time::Instant::now();
-        let ranges = written.take(start as usize, looked_end);
+        let ranges = {
+            let _span = crate::trace::span("heap sync: pages written");
+            written.take(start as usize, looked_end)
+        };
         // The changed records of every page, made together on the wide threads
         // (`VICTORY_HEAP_SYNC_WIDE=0`: page by page here, as before).
         let mut due: Vec<(u32, u64)> = Vec::new();

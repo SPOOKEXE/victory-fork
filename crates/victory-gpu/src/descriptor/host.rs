@@ -193,6 +193,7 @@ fn locked<T>(lock: &Mutex<T>, at: usize) -> std::sync::MutexGuard<'_, T> {
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             let started = std::time::Instant::now();
+            let _span = crate::trace::span("heap lock wait");
             let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             LOCKS[at].fetch_add(1, Relaxed);
             LOCKS[at + 1].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
@@ -2454,9 +2455,16 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(&mut made, stale);
+            let stale = {
+                let _span = crate::trace::span("make slot: note the memory it shows");
+                self.note_buffer(index, Some(&view), for_draw)
+            };
+            if !stale.is_empty() {
+                let _span = crate::trace::span("make slot: unmake views gone stale");
+                for stale in stale {
+                    if stale != index {
+                        self.unmake(&mut made, stale);
+                    }
                 }
             }
             // A view of a texture object that has no host copy yet waits
@@ -2489,11 +2497,14 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
+                let _span = crate::trace::span("make slot: the host view");
                 make(&view, self.cpu(index))
             };
             if kept.is_none() && !self.sampler {
+                let _span = crate::trace::span("make slot: a null view");
                 null_for(&view, self.cpu(index));
             }
+            let _span = crate::trace::span("make slot: keep its resource");
             self.keep(index, kept.flatten());
             // After the slot is made and kept: a reader without the lock
             // takes the record as made only once it is.

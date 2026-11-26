@@ -3804,13 +3804,20 @@ impl Shadow {
         let _reads_as = crate::backreads::reading_as(crate::backreads::REFRESH, self.id);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        if self.card.is_some() && from < to && copy_changed() && self.copy_changed(from, to) {
-            return to - from;
+        if self.card.is_some() && from < to && copy_changed() {
+            let _span = crate::trace::span("copy: compare with the card copy's CPU side");
+            if self.copy_changed(from, to) {
+                return to - from;
+            }
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        {
+            let _span = crate::trace::span("copy: title bytes in");
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
+        let _span = crate::trace::span("copy: notes of what changed");
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
