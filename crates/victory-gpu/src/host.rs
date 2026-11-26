@@ -1168,8 +1168,9 @@ pub(crate) struct HostList {
     /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
     /// last, open until the next one is bound or the list closes.
     pipeline_meter: AtomicU32,
-    /// This recording's mark in the breadcrumbs ([`crumb_list`]), taken at
-    /// each reset (diagnostics).
+    /// This recording's number in the breadcrumbs ([`crumb_list`]), taken
+    /// at each reset (diagnostics).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     crumb_id: AtomicU32,
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
