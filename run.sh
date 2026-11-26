@@ -174,6 +174,10 @@ default VICTORY_DISPATCH_SPREAD 0
 # VICTORY_SETTLE_ROOM: lists in the air x2, changed runs merged x8): the
 # café's 35 ms waits a frame for a merge that gave up went (run Z2).
 default VICTORY_SETTLE_ROOM 1
+# A submission's texture checks side by side on the helper threads before
+# each write of ours (the parent's VICTORY_PARALLEL_REFRESH): run AF, on and
+# off every 20 s, about 4 ms less of the submitting thread's preparing.
+default VICTORY_PARALLEL_REFRESH 1
 # Fills of upload memory wait for flights only where shaders have written
 # this run (one wait a frame in the café instead of two).
 default VICTORY_FILL_WAIT learn
