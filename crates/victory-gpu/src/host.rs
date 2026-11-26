@@ -142,10 +142,17 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
+///
+/// A texture let go that the title uses again is made and uploaded anew:
+/// in the open world 17,119 of them, 9.6 GB, since the start, with the
+/// card at 85 % of its budget and textures idle a second let go. So they
+/// are kept long while there is room, and let go quickly only when the
+/// card is close to full.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    const NORMAL_MS: u64 = 30_000;
+    const MODERATE_MS: u64 = 10_000;
+    const HIGH_MS: u64 = 3_000;
+    const FULL_MS: u64 = 1_000;
     let Some([budget, used, ..]) = video_memory else {
         return NORMAL_MS;
     };
@@ -153,12 +160,11 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         return NORMAL_MS;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
-    if used_pct >= 85 {
-        HIGH_MS
-    } else if used_pct >= 75 {
-        MODERATE_MS
-    } else {
-        NORMAL_MS
+    match used_pct {
+        96.. => FULL_MS,
+        92.. => HIGH_MS,
+        85.. => MODERATE_MS,
+        _ => NORMAL_MS,
     }
 }
 
@@ -1303,19 +1309,22 @@ impl Drop for HostList {
     }
 }
 
-/// A list's mark in the breadcrumbs' high half: its address's bits.
+/// A recording's number in the breadcrumbs: its low half is the mark in
+/// the high half of the first two words, the whole of it the third and
+/// fourth word ([`crumb`]).
 #[cfg(feature = "diagnostics")]
 fn crumb_list(list: &HostList) -> u32 {
     list.crumb_id.load(Ordering::Relaxed)
 }
 
-/// A new recording's mark: numbered in turn, leaving out the marks of our
-/// own lists (0xfff0 and up): unique among the recordings of the last
-/// minutes, which a mark built from the list's address was not.
+/// A new recording's number: counted from 1 (0xfff1 and 0xfff2 in the
+/// marks are our own lists, whose whole numbers are 0xffff_fff1 and
+/// 0xffff_fff2). Sixteen bits came round within a minute of play.
 #[cfg(feature = "diagnostics")]
 fn next_crumb_id() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed) % 0xfff0
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    if id & 0xfff0 == 0xfff0 { NEXT.fetch_add(16, Ordering::Relaxed) } else { id }
 }
 
 /// A breadcrumb of a list of the layer's own (`mark` names it: 0xfff1 the
@@ -1323,20 +1332,34 @@ fn next_crumb_id() -> u32 {
 /// compare after a submission's lists) or the start of a host list
 /// (`crumb_list << 16 | 0xfffe`), written the same way.
 #[cfg(feature = "diagnostics")]
-fn crumb(list: &ID3D12GraphicsCommandList, value: u32) {
+fn crumb(list: &ID3D12GraphicsCommandList, value: u32, id: u32) {
     if timing() {
         return;
     }
+    crumb_words(list, value, id);
+}
+
+/// Writes the breadcrumbs: `value` (mark and command) as begun and as all
+/// before done, then the recording's whole number `id` the same two ways.
+#[cfg(feature = "diagnostics")]
+fn crumb_words(list: &ID3D12GraphicsCommandList, value: u32, id: u32) {
     if let Some((_, gpu, _)) = crumbs()
         && let Ok(list) = list.cast::<ID3D12GraphicsCommandList2>()
     {
         let params = [
             D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: *gpu, Value: value },
             D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu + 4, Value: value },
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu + 8, Value: id },
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu + 12, Value: id },
         ];
-        let modes = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT];
-        // SAFETY: an open list; our buffer's first two words.
-        unsafe { list.WriteBufferImmediate(2, params.as_ptr(), Some(modes.as_ptr())) };
+        let modes = [
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+        ];
+        // SAFETY: an open list; our buffer's first four words.
+        unsafe { list.WriteBufferImmediate(4, params.as_ptr(), Some(modes.as_ptr())) };
     }
 }
 
@@ -1363,25 +1386,26 @@ fn wait_for_card(event: HANDLE, what: &str) {
 /// (`VICTORY_D3D12_DRED=1`) the commands around where the card stopped.
 #[cfg(feature = "diagnostics")]
 fn crumbs_report(what: &str) {
-    let Some((begun, done)) = crumbs_read(false) else {
+    let Some((begun, done, begun_id, done_id)) = crumbs_read(false) else {
         tracing::error!("{what} has not finished in 2 s (VICTORY_CRUMBS=1 would say where)");
         return;
     };
     tracing::error!(
         "breadcrumbs: {what} has not finished in 2 s; words {begun:#010x} begun, {done:#010x} done \
-         (0xfff1: our send-and-hash list, 0xfff2: our compare list, low 0xfffe: a list just started)"
+         (0xfff1: our send-and-hash list, 0xfff2: our compare list, low 0xfffe: a list just started); \
+         recordings {begun_id} begun, {done_id} done"
     );
     let lists = CRUMB_LISTS.lock().unwrap_or_else(|e| e.into_inner());
     // (A list in the table is alive: its drop takes it out under this lock.)
-    let Some(list) = lists.as_ref().and_then(|m| m.get(&(begun >> 16)).copied()).map(|at| unsafe { &*(at as *const HostList) })
+    let Some(list) = lists.as_ref().and_then(|m| m.get(&begun_id).copied()).map(|at| unsafe { &*(at as *const HostList) })
     else {
-        tracing::error!("breadcrumbs: no host list has mark {:#x}", begun >> 16);
+        tracing::error!("breadcrumbs: no host list is recording {begun_id} now (it was reset since, or is a list of ours)");
         return;
     };
     let pipelines = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    tracing::error!("breadcrumbs: list {:#x}, its pipelines: {pipelines:?}", begun >> 16);
+    tracing::error!("breadcrumbs: recording {begun_id}, its pipelines: {pipelines:?}");
     let notes = list.notes.lock().unwrap_or_else(|e| e.into_inner());
-    let (begun, done) = (begun & 0xffff, if done >> 16 == begun >> 16 { done & 0xffff } else { 0 });
+    let (begun, done) = (begun & 0xffff, if done_id == begun_id { done & 0xffff } else { 0 });
     if begun == 0xfffe {
         tracing::error!("breadcrumbs: the list had begun and none of its noted commands had");
         return;
@@ -1397,17 +1421,19 @@ fn crumbs_report(what: &str) {
     }
 }
 
-/// The two breadcrumbs (begun, all before done), set to `u32::MAX` first.
+/// The breadcrumbs (mark and command begun, all before done; the
+/// recording begun, all before done), set to `u32::MAX` first.
 #[cfg(feature = "diagnostics")]
-fn crumbs_read(reset: bool) -> Option<(u32, u32)> {
+fn crumbs_read(reset: bool) -> Option<(u32, u32, u32, u32)> {
     let (_, _, data) = crumbs()?;
     let words = *data as *mut u32;
-    // SAFETY: the mapped buffer's first two words; the card writes them.
+    // SAFETY: the mapped buffer's first four words; the card writes them.
     unsafe {
-        let read = (words.read_volatile(), words.add(1).read_volatile());
+        let read = (words.read_volatile(), words.add(1).read_volatile(), words.add(2).read_volatile(), words.add(3).read_volatile());
         if reset {
-            words.write_volatile(u32::MAX);
-            words.add(1).write_volatile(u32::MAX);
+            for k in 0..4 {
+                words.add(k).write_volatile(u32::MAX);
+            }
         }
         Some(read)
     }
@@ -4948,7 +4974,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let shot_span = crate::shot::span_begin(list);
                     #[cfg(feature = "diagnostics")]
-                    crumb(list, 0xfff1_0000);
+                    crumb(list, 0xfff1_0000, 0xffff_fff1);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
                     // In three steps over all the copies ([`sync_batched`]):
@@ -5100,7 +5126,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let shot_span = crate::shot::span_begin(list);
                     #[cfg(feature = "diagnostics")]
-                    crumb(list, 0xfff2_0000);
+                    crumb(list, 0xfff2_0000, 0xffff_fff2);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -6399,15 +6425,15 @@ impl Host {
                             let names = |l: &HostList| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             let what = if timing() { names(runs[i]) } else { runs.iter().flat_map(|l| names(l)).collect() };
                             tracing::error!(submission = *submitted, lists = runs.len(), "the card has not finished a submission in 2 s; its pipelines: {what:?}");
-                            if let Some((mut begun, mut done)) = crumbs_read(false) {
+                            if let Some((mut begun, mut done, begun_id, _)) = crumbs_read(false) {
                                 let mut begun_mark = u32::MAX;
                                 tracing::error!("breadcrumbs: words {begun:#010x} begun, {done:#010x} done (0xfff1: our send-and-hash list, 0xfff2: our compare list, low 0xfffe: a list just started)");
                                 // Outside the timing run: the list the words name.
                                 let list = if timing() {
                                     Some(runs[i])
                                 } else {
-                                    begun_mark = begun >> 16;
-                                    let found = runs.iter().copied().find(|l| crumb_list(l) == begun >> 16);
+                                    begun_mark = begun_id;
+                                    let found = runs.iter().copied().find(|l| crumb_list(l) == begun_id);
                                     tracing::error!(
                                         "breadcrumbs: list mark {:#x} (lists here: {:x?}), the done mark's list {:#x}",
                                         begun >> 16,
@@ -7140,7 +7166,7 @@ impl HostList {
                     map.remove(&old);
                 }
             }
-            crumb(&self.list, crumb_list(self) << 16 | 0xfffe);
+            crumb(&self.list, (crumb_list(self) & 0xffff) << 16 | 0xfffe, crumb_list(self));
             CRUMB_LISTS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -7679,17 +7705,10 @@ impl HostList {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
-            if let Some((_, gpu, _)) = crumbs()
-                && let Ok(list) = self.list.cast::<ID3D12GraphicsCommandList2>()
-            {
-                let value = if timing() { at } else { crumb_list(self) << 16 | (at & 0xffff) };
-                let params = [
-                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: *gpu, Value: value },
-                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu + 4, Value: value },
-                ];
-                let modes = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT];
-                // SAFETY: an open list; our buffer's first two words.
-                unsafe { list.WriteBufferImmediate(2, params.as_ptr(), Some(modes.as_ptr())) };
+            if crumbs().is_some() {
+                let id = crumb_list(self);
+                let value = if timing() { at } else { (id & 0xffff) << 16 | (at & 0xffff) };
+                crumb_words(&self.list, value, id);
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
@@ -10241,19 +10260,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn vram_idle_ms_scales_with_pressure() {
         use super::vram_idle_ms;
         let gib = 1024 * 1024 * 1024;
-        // Normal (< 75%)
-        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
-        // Moderate (75%..85%)
-        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
-        // High (>= 85%, including over-budget)
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
+        // Room (< 85%): kept long.
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 30_000);
+        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 30_000);
+        // Filling (85%..92%), close (92%..96%), full (>= 96%, over budget too).
+        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 10_000);
+        assert_eq!(vram_idle_ms(Some([100, 91, 0, 0])), 10_000);
+        assert_eq!(vram_idle_ms(Some([100, 92, 0, 0])), 3_000);
+        assert_eq!(vram_idle_ms(Some([100, 96, 0, 0])), 1_000);
         assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
         // Missing or zero budget falls back to normal
-        assert_eq!(vram_idle_ms(None), 5_000);
-        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(None), 30_000);
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 30_000);
     }
 
     #[test]
