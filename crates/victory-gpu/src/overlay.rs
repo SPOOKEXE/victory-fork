@@ -94,6 +94,11 @@ struct Snap {
     frames: Vec<f32>,
     spans: HashMap<(String, &'static str), (u64, u32)>,
     gpu: HashMap<String, (u64, u32)>,
+    /// Each span of the recording (its key's place in `keys`, start, length)
+    /// and the presents' times, for each span's least and most in one frame.
+    events: Vec<(u32, u64, u64)>,
+    keys: HashMap<(String, &'static str), u32>,
+    presents: Vec<u64>,
 }
 
 /// Whether a snapshot is being recorded: spans and the card's pipelines are
@@ -291,6 +296,9 @@ fn hand_over(spans: &mut Vec<(&'static str, u32, u64, u64)>) {
                 let e = snap.spans.entry((g.clone(), name)).or_insert((0, 0));
                 e.0 += ns;
                 e.1 += 1;
+                let next = snap.keys.len() as u32;
+                let key = *snap.keys.entry((g.clone(), name)).or_insert(next);
+                snap.events.push((key, start, ns));
             }
             let e = s.spans.entry((g, name)).or_insert((0, 0));
             e.0 += ns;
@@ -378,6 +386,9 @@ pub(crate) fn frame() {
                 frames: Vec::new(),
                 spans: HashMap::new(),
                 gpu: HashMap::new(),
+                events: Vec::new(),
+                keys: HashMap::new(),
+                presents: Vec::new(),
             });
             RECORDING.store(true, Relaxed);
             // (the machine's load, looked at every second, for the snapshot)
@@ -395,6 +406,7 @@ pub(crate) fn frame() {
     if let Some(snap) = s.snap.as_mut() {
         if now < snap.started + SNAP_NS {
             snap.frames.push(frame_ms);
+            snap.presents.push(now);
         } else if !snap.ended {
             // (the first present past the recording: the totals' growth over it)
             snap.ended = true;
@@ -612,6 +624,23 @@ fn snapshot_due(now: u64) -> bool {
     }
 }
 
+/// For each span of `snap` (by its place in `keys`): the least and the most
+/// nanoseconds it took in one frame of the recording. A span counts for the
+/// frame it began in (frames end at the recorded presents); a frame without
+/// it counts as 0 for the least.
+fn span_extremes(snap: &Snap) -> (Vec<u64>, Vec<u64>) {
+    let frames = snap.presents.len().max(1);
+    let keys = snap.keys.len();
+    let mut sums = vec![0u64; keys * frames];
+    for &(key, start, ns) in &snap.events {
+        let frame = snap.presents.partition_point(|&p| p <= start).min(frames - 1);
+        sums[key as usize * frames + frame] += ns;
+    }
+    let least = (0..keys).map(|k| sums[k * frames..(k + 1) * frames].iter().copied().min().unwrap_or(0)).collect();
+    let most = (0..keys).map(|k| sums[k * frames..(k + 1) * frames].iter().copied().max().unwrap_or(0)).collect();
+    (least, most)
+}
+
 /// Writes snapshot `snap` as Markdown to `snapshots/<seconds>.md` (relative to
 /// the run's folder, where `run.sh` starts the title): frame times, the frame
 /// log's totals, the processor's spans by thread group, the card's time by
@@ -626,18 +655,26 @@ fn write_snapshot(snap: &Snap, laid: Option<&Laid>, vram: (u64, u64)) {
     let mut md = String::new();
     let seconds = snap.started as f64 / 1e9;
     let _ = writeln!(md, "# Snapshot at {seconds:.0} s, frame {}\n", crate::frame::current());
-    let _ = writeln!(md, "{} frames in {:.1} s: mean {mean:.1} ms ({:.1} fps), median {:.1}, p90 {:.1}, max {:.1}. Card memory {} of {} MB.\n",
-        snap.frames.len(), SNAP_NS as f64 / 1e9, 1000.0 / mean.max(0.001), pick(0.5), pick(0.9), pick(1.0), vram.0, vram.1);
+    let _ = writeln!(md, "{} frames in {:.1} s: mean {mean:.1} ms ({:.1} fps), min {:.1}, median {:.1}, p90 {:.1}, max {:.1}. Card memory {} of {} MB.\n",
+        snap.frames.len(), SNAP_NS as f64 / 1e9, 1000.0 / mean.max(0.001), pick(0.0), pick(0.5), pick(0.9), pick(1.0), vram.0, vram.1);
     let per = |t: T| snap.totals.get(t as usize).copied().unwrap_or(0) as f64 / n;
     let _ = writeln!(md, "Per frame: card idle {:.1} ms ({:.1} behind us), up {:.1} MB, back {:.1} MB, present {:.1} ms.\n",
         per(T::CardIdleUs) / 1e3, per(T::CardIdleBehindUs) / 1e3, per(T::CopyBytes) / 1e6, per(T::CopyBackBytes) / 1e6, per(T::PresentUs) / 1e3);
     // processor
-    let _ = writeln!(md, "## Processor: spans per frame by thread\n\n| thread | span | ms | count |\n|---|---|---:|---:|");
-    let mut rows: Vec<(&String, &&'static str, f64, f64)> =
-        snap.spans.iter().map(|((g, name), (ns, c))| (g, name, *ns as f64 / 1e6 / n, f64::from(*c) / n)).collect();
+    let _ = writeln!(md, "## Processor: spans per frame by thread\n\nms: the mean a frame; min and max: the least and most in one frame of the recording (spans by the frame they began in).\n\n| thread | span | ms | min | max | count |\n|---|---|---:|---:|---:|---:|");
+    let (least, most) = span_extremes(snap);
+    let mut rows: Vec<(&String, &&'static str, f64, f64, f64, f64)> = snap
+        .spans
+        .iter()
+        .map(|((g, name), (ns, c))| {
+            let k = snap.keys.get(&(g.clone(), *name)).map_or(usize::MAX, |&k| k as usize);
+            let at = |v: &Vec<u64>| v.get(k).map_or(0.0, |&ns| ns as f64 / 1e6);
+            (g, name, *ns as f64 / 1e6 / n, at(&least), at(&most), f64::from(*c) / n)
+        })
+        .collect();
     rows.sort_by(|a, b| a.0.cmp(b.0).then(b.2.total_cmp(&a.2)));
-    for (g, name, ms, count) in rows.iter().filter(|r| r.2 >= 0.05) {
-        let _ = writeln!(md, "| {g} | {name} | {ms:.2} | {count:.1} |");
+    for (g, name, ms, min, max, count) in rows.iter().filter(|r| r.2 >= 0.05) {
+        let _ = writeln!(md, "| {g} | {name} | {ms:.2} | {min:.2} | {max:.2} | {count:.1} |");
     }
     // card
     let all: f64 = snap.gpu.values().map(|v| v.0 as f64).sum::<f64>() / 1e3 / n;
@@ -1149,6 +1186,34 @@ mod tests {
         for c in "0123456789FPSMS".chars() {
             assert!(super::glyph(c).iter().any(|&r| r != 0), "{c}");
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use std::collections::HashMap;
+
+    /// Three frames ending at 10, 20 and 30: span "a" takes 1+2 in the
+    /// first, nothing in the second and 5 in the third; "b" 4 in each.
+    #[test]
+    fn a_spans_least_and_most_are_by_the_frame_it_began_in() {
+        let mut keys = HashMap::new();
+        keys.insert(("g".to_owned(), "a"), 0);
+        keys.insert(("g".to_owned(), "b"), 1);
+        let snap = super::Snap {
+            started: 0,
+            totals: Vec::new(),
+            ended: true,
+            frames: vec![10.0, 10.0, 10.0],
+            spans: HashMap::new(),
+            gpu: HashMap::new(),
+            events: vec![(0, 1, 1), (0, 5, 2), (0, 25, 5), (1, 2, 4), (1, 12, 4), (1, 22, 4)],
+            keys,
+            presents: vec![10, 20, 30],
+        };
+        let (least, most) = super::span_extremes(&snap);
+        assert_eq!((least[0], most[0]), (0, 5));
+        assert_eq!((least[1], most[1]), (4, 4));
     }
 }
 
