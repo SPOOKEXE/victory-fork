@@ -496,9 +496,18 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
-        // Each host wave as a wave of its own (`lower::with_local_waves`),
-        // for programs still stopped where not every lane runs.
-        let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
+        // Each host wave as a wave of its own (`lower::with_local_waves`), for programs
+        // still stopped where not every lane runs: by default only for programs held from
+        // the wide form ([`wave_wide_held`]). The batch culls (`CS_Tree_BatchCull`,
+        // `CS_Prop_BatchCull`) in it gave out-of-range list indices: the card faulted in
+        // them and in the draws of their lists (the first boat cutscene, Xid 13), and ran
+        // clean through it once the wide form took them. `VICTORY_WAVE_LOCAL=1`: for every
+        // program, as before; `=0`: for none.
+        let local_on = match std::env::var("VICTORY_WAVE_LOCAL").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => WIDE_HELD.get(),
+        };
         // Where the wave operations are the allocation idiom
         // ([`lower::wave_local`]) that is exact. Other programs are taken
         // the same way last of all, each half-wave giving its own results
