@@ -3659,9 +3659,16 @@ impl Shadow {
                 }
                 return 0;
             }
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let asked = {
+                let _span = crate::trace::span("refresh: ask what changed");
+                crate::watch::writes(from, to, true)
+            };
+            if let Some((now, written)) = asked {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = {
+                    let _span = crate::trace::span("refresh: copy changed pages");
+                    self.copy_stale(from, to, now, &written)
+                };
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3677,6 +3684,7 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let _span = crate::trace::span("refresh: copy whole (not watched)");
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);

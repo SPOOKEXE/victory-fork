@@ -209,7 +209,13 @@ pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
 /// more queries and a resolve at every change of pipeline).
 pub(crate) fn pipelines() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1"))
+    let set = *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1"));
+    // (And while the overlay's card view is up, F10.)
+    #[cfg(windows)]
+    if !set && on() && crate::overlay::gpu_shown() {
+        return true;
+    }
+    set
 }
 
 /// The pipeline `name` is bound on `list` here: the first timestamp of a
@@ -401,6 +407,8 @@ pub(crate) fn collect() {
             }
             Kind::Pipeline => {
                 if let Some(name) = m.names.remove(&pair) {
+                    #[cfg(windows)]
+                    crate::overlay::gpu_span(&name, us);
                     let e = m.by_pipeline.entry(name).or_insert((0, 0));
                     e.0 += 1;
                     e.1 += us;

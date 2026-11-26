@@ -220,9 +220,19 @@ fn sweep() {
     {
         return;
     }
-    crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
+    {
+        let _span = crate::trace::span("sweep: pipeline library");
+        crate::pipeline::trim_library();
+    }
+    {
+        let _span = crate::trace::span("sweep: windows");
+        crate::shadow::let_go_idle();
+    }
+    {
+        let _span = crate::trace::span("sweep: staging");
+        crate::texture::let_go_idle();
+    }
+    let _span = crate::trace::span("sweep: textures");
     crate::resource::let_go_idle();
 }
 
@@ -3014,6 +3024,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
+                    let _span = crate::trace::span("step: title buffer copy");
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         // A copy that only READS where flights may write is
                         // not waited for either, and checked like a fill
@@ -3833,7 +3844,7 @@ fn late_helper() {
         // SAFETY: our fence and event.
         unsafe {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+                { let _sync = crate::trace::span("gpu sync: settle helper"); WaitForSingleObject(event, INFINITE); }
             }
         }
         {
@@ -3975,7 +3986,7 @@ fn relay_worker() {
                 host.relay_land(items, &mut fetch)
             }
             Err(target) => {
-                let _span = crate::trace::span("wait for card");
+                let _span = crate::trace::span("gpu sync: copy-back waits for card");
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
@@ -5322,7 +5333,7 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                { let _sync = crate::trace::span("gpu sync: copy-back fetch"); WaitForSingleObject(event, INFINITE); }
                 Ok(after)
             })()
         };
@@ -5727,7 +5738,7 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    { let _sync = crate::trace::span("gpu sync: copy-back"); WaitForSingleObject(self.event, INFINITE); }
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5975,7 +5986,7 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
-                            WaitForSingleObject(self.event, INFINITE);
+                            { let _sync = crate::trace::span("gpu sync: settle"); WaitForSingleObject(self.event, INFINITE); }
                             stood(waiting);
                             working(true);
                         }
@@ -6303,6 +6314,7 @@ impl Host {
                         // A list that has not finished in two seconds has
                         // most likely faulted the card (Xid 13): named
                         // before the wait that may never end.
+                        let _sync = crate::trace::span("gpu sync: submission");
                         #[cfg(feature = "diagnostics")]
                         if WaitForSingleObject(self.event, 2_000) != windows::Win32::Foundation::WAIT_OBJECT_0 {
                             let names = |l: &HostList| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -8084,6 +8096,7 @@ impl HostList {
                     len
                 }
                 &Step::Fill(dst, src, len) => {
+                    let _span = crate::trace::span("step: fill upload memory");
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -8105,6 +8118,7 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    let _span = crate::trace::span(if matches!(step, Step::Run(_)) { "step: our code on title memory" } else { "step: host work" });
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }

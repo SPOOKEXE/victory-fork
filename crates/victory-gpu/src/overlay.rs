@@ -30,6 +30,9 @@ const ROW: u32 = 9;
 const DEPTHS: [usize; 4] = [1, 3, 6, usize::MAX];
 
 static SHOWN: AtomicBool = AtomicBool::new(false);
+/// Which view is up: the processor's spans (F9) or the card's time by
+/// pipeline (F10).
+static GPU_VIEW: AtomicBool = AtomicBool::new(false);
 /// The first row shown, and the depth.
 static SCROLL: AtomicU32 = AtomicU32::new(0);
 static DEPTH: AtomicU32 = AtomicU32::new(3);
@@ -47,11 +50,15 @@ struct State {
     /// half second; then per frame over the half second before (ms, count).
     spans: HashMap<(String, &'static str), (u64, u32)>,
     rows: Vec<(String, &'static str, f64, f64)>,
+    /// The card's time by pipeline (F10): microseconds and count since the
+    /// last half second, then per frame (ms, count) over the one before.
+    gpu: HashMap<String, (u64, u32)>,
+    gpu_rows: Vec<(String, f64, f64)>,
     summed: u32,
     since_ns: u64,
     vram: (u64, u64),
-    /// F9, Up, Down, Left, Right as last seen.
-    keys: [bool; 5],
+    /// F9, Up, Down, Left, Right, F10 as last seen.
+    keys: [bool; 6],
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -71,6 +78,23 @@ pub fn shown() -> bool {
     SHOWN.load(Relaxed)
 }
 
+/// Whether the card's view (F10) is up: the card meter then times every
+/// pipeline (`crate::cardmeter::pipelines`).
+pub(crate) fn gpu_shown() -> bool {
+    shown() && GPU_VIEW.load(Relaxed)
+}
+
+/// The card ran pipeline `name` for `us` (a pair of the card meter, read
+/// some frames after it ran).
+pub(crate) fn gpu_span(name: &str, us: u64) {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = state.as_mut() {
+        let e = s.gpu.entry(name.to_owned()).or_insert((0, 0));
+        e.0 += us;
+        e.1 += 1;
+    }
+}
+
 /// A thread's name, once, as it first times a span.
 pub(crate) fn thread_name(tid: u32, name: &str) {
     let group = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-' || c == ' ');
@@ -79,23 +103,39 @@ pub(crate) fn thread_name(tid: u32, name: &str) {
 }
 
 /// A span ended: `ns` long, on thread `tid` (`crate::trace::CARD_TRACK`
-/// for the card's).
+/// for the card's). Gathered per thread and handed over 128 at a time:
+/// thousands a frame from seven threads into one lock was a wait of its own.
 pub(crate) fn span(name: &'static str, tid: u32, ns: u64) {
-    let group = if tid == crate::trace::CARD_TRACK {
-        "card".to_owned()
-    } else {
-        THREADS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .and_then(|t| t.get(&tid).cloned())
-            .unwrap_or_else(|| "other".to_owned())
+    thread_local! {
+        static HERE: std::cell::RefCell<Vec<(&'static str, u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    HERE.with(|here| {
+        let mut here = here.borrow_mut();
+        here.push((name, tid, ns));
+        if here.len() >= 128 || tid == crate::trace::CARD_TRACK {
+            hand_over(&mut here);
+        }
+    });
+}
+
+fn hand_over(spans: &mut Vec<(&'static str, u32, u64)>) {
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let group = |tid: u32| {
+        if tid == crate::trace::CARD_TRACK {
+            "card".to_owned()
+        } else {
+            threads.as_ref().and_then(|t| t.get(&tid).cloned()).unwrap_or_else(|| "other".to_owned())
+        }
     };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = state.as_mut() {
-        let e = s.spans.entry((group, name)).or_insert((0, 0));
-        e.0 += ns;
-        e.1 += 1;
+        for (name, tid, ns) in spans.drain(..) {
+            let e = s.spans.entry((group(tid), name)).or_insert((0, 0));
+            e.0 += ns;
+            e.1 += 1;
+        }
+    } else {
+        spans.clear();
     }
 }
 
@@ -112,19 +152,31 @@ pub(crate) fn frame() {
         mean: vec![0.0; T::Count as usize],
         spans: HashMap::new(),
         rows: Vec::new(),
+        gpu: HashMap::new(),
+        gpu_rows: Vec::new(),
         summed: 0,
         since_ns: now,
         vram: (0, 0),
-        keys: [false; 5],
+        keys: [false; 6],
     });
     {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         // SAFETY: plain queries.
-        let down = [0x78, 0x26, 0x28, 0x25, 0x27].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
+        let down = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79].map(|vk| unsafe { GetAsyncKeyState(vk) } < 0);
         let pressed = |k: usize| down[k] && !s.keys[k];
         let front = focused();
-        if pressed(0) && front {
-            SHOWN.fetch_xor(true, Relaxed);
+        // F9 the processor's view, F10 the card's: the same key again hides
+        // it, the other key switches to the other view.
+        for (key, gpu) in [(0, false), (5, true)] {
+            if pressed(key) && front {
+                if shown() && GPU_VIEW.load(Relaxed) == gpu {
+                    SHOWN.store(false, Relaxed);
+                } else {
+                    GPU_VIEW.store(gpu, Relaxed);
+                    SHOWN.store(true, Relaxed);
+                    SCROLL.store(0, Relaxed);
+                }
+            }
         }
         if shown() && front {
             let at = SCROLL.load(Relaxed);
@@ -177,6 +229,8 @@ pub(crate) fn frame() {
             _ => 6,
         };
         s.rows.sort_by(|a, b| order(&a.0).cmp(&order(&b.0)).then(a.0.cmp(&b.0)).then(b.2.total_cmp(&a.2)));
+        s.gpu_rows = s.gpu.drain().map(|(name, (us, count))| (name, us as f64 / 1e3 / n, f64::from(count) / n)).collect();
+        s.gpu_rows.sort_by(|a, b| b.1.total_cmp(&a.1));
         s.summed = 0;
         s.since_ns = now;
         if shown()
@@ -236,18 +290,31 @@ pub(crate) fn draw() -> Vec<u32> {
         TEXT,
     );
     let depth = DEPTHS[DEPTH.load(Relaxed) as usize];
-    text_at(&mut px, 2, 22, "SPAN PER FRAME                                      MS     X", HEAD);
-    // A heading when the thread group changes, then its spans.
     let mut lines: Vec<(String, Option<(f64, f64)>)> = Vec::new();
-    let (mut group, mut in_group) = ("", 0);
-    for (g, name, ms, count) in &s.rows {
-        if g != group {
-            (group, in_group) = (g, 0);
-            lines.push((g.to_uppercase(), None));
+    if GPU_VIEW.load(Relaxed) {
+        // The card's view: its time by pipeline, heaviest first.
+        text_at(&mut px, 2, 22, "CARD PER FRAME (F9: PROCESSOR)                      MS     X", HEAD);
+        let all: f64 = s.gpu_rows.iter().map(|r| r.1).sum();
+        lines.push((format!("ALL PIPELINES {all:.1} MS"), None));
+        for (name, ms, count) in &s.gpu_rows {
+            lines.push((name.trim_matches(|c| c == '[' || c == ']').to_uppercase(), Some((*ms, *count))));
         }
-        in_group += 1;
-        if in_group <= depth {
-            lines.push((name.to_uppercase(), Some((*ms, *count))));
+        if s.gpu_rows.is_empty() {
+            lines.push(("(THE CARD'S TIMES ARRIVE A SECOND AND A HALF LATE)".to_owned(), None));
+        }
+    } else {
+        text_at(&mut px, 2, 22, "SPAN PER FRAME (F10: CARD)                          MS     X", HEAD);
+        // A heading when the thread group changes, then its spans.
+        let (mut group, mut in_group) = ("", 0);
+        for (g, name, ms, count) in &s.rows {
+            if g != group {
+                (group, in_group) = (g, 0);
+                lines.push((g.to_uppercase(), None));
+            }
+            in_group += 1;
+            if in_group <= depth {
+                lines.push((name.to_uppercase(), Some((*ms, *count))));
+            }
         }
     }
     let first = (SCROLL.load(Relaxed) as usize).min(lines.len().saturating_sub(ROWS));

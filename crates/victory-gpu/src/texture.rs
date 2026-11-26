@@ -456,6 +456,7 @@ pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { st
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+    let _span = crate::trace::span(["texture: lock", "texture: ask what changed", "texture: wait for memory to hold still"][slot.min(2)]);
     let started = std::time::Instant::now();
     let out = f();
     let us = started.elapsed().as_micros() as u64;
@@ -1056,7 +1057,10 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                {
+                    let _span = crate::trace::span("texture: read");
+                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                }
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -1120,8 +1124,11 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                {
+                    let _span = crate::trace::span("texture: read");
+                    crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                }
+                let hash = { let _span = crate::trace::span("texture: hash"); blake3::hash(read) };
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1141,7 +1148,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = { let _span = crate::trace::span("texture: hash"); blake3::hash(tiled) };
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1157,7 +1164,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = { let _span = crate::trace::span("texture: hash"); blake3::hash(tiled) };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1212,7 +1219,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = { let _span = crate::trace::span("texture: hash"); blake3::hash(read) };
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1231,6 +1238,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        let _span = crate::trace::span("texture: detile");
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step

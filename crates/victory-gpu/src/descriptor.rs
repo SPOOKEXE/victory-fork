@@ -223,7 +223,10 @@ pub(crate) fn sync_heaps() {
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
                 let reading = std::time::Instant::now();
-                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
+                let read = {
+                    let _span = crate::trace::span("heap sync: read page");
+                    crate::host::read_into(from as *const u8, &mut page_bytes)
+                };
                 SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
                 if read {
                     pages += 1;
@@ -232,6 +235,7 @@ pub(crate) fn sync_heaps() {
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
+                        let _span = crate::trace::span("heap sync: mirror records");
                         let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
                         looked += seen;
                         mirrored += made;
