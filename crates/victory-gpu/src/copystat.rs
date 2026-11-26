@@ -466,6 +466,32 @@ mod sites {
         }
     }
 
+    /// `at` as `module+offset` (the module's file name), if a module holds it.
+    fn module_of(at: usize) -> String {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
+            GetModuleHandleExW,
+        };
+        let mut module = std::ptr::null_mut();
+        // SAFETY: a lookup by address; the handle is not kept.
+        let found = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                at as *const u16,
+                &mut module,
+            )
+        } != 0;
+        if !found {
+            return format!("{at:#x}");
+        }
+        let mut name = [0u16; 260];
+        // SAFETY: a buffer of 260 characters.
+        let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let path = String::from_utf16_lossy(&name[..n]);
+        let file = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned();
+        format!("{file}+{:#x}", at - module as usize)
+    }
+
     /// The places holding the most sampled bytes alive (estimated: times
     /// [`SITE_EVERY`]), with their return addresses as `exe+offset`.
     pub(super) fn report() -> Vec<String> {
@@ -486,7 +512,7 @@ mod sites {
                     .filter(|&f| f != 0)
                     .map(|f| match f.checked_sub(base) {
                         Some(o) if o < 1 << 30 => format!("exe+{o:#x}"),
-                        _ => format!("{f:#x}"),
+                        _ => module_of(f),
                     })
                     .collect();
                 format!(
