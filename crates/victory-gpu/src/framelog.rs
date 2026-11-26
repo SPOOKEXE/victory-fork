@@ -155,7 +155,7 @@ pub enum H {
 
 const HN: usize = H::Count as usize;
 
-thread_local! {
+crate::fast_local! {
     static HERE: std::cell::Cell<[u64; HN]> = const { std::cell::Cell::new([0; HN]) };
 }
 

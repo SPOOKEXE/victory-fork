@@ -376,7 +376,7 @@ mod tests {
         }
     }
 
-    thread_local! {
+    victory_gpu::fast_local! {
         /// The system commands `recording` received, low four bits cleared.
         static COMMANDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     }

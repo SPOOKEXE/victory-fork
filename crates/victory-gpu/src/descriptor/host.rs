@@ -207,7 +207,7 @@ fn locked<T>(lock: &Mutex<T>, _: usize) -> std::sync::MutexGuard<'_, T> {
 }
 
 #[cfg(feature = "diagnostics")]
-thread_local! {
+crate::fast_local! {
     /// This thread's calls of [`HostHeap::mirror`], for timing one in 16.
     static MIRRORS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -710,7 +710,7 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
-thread_local! {
+crate::fast_local! {
     /// This thread is inside [`HostHeap::publish`].
     static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

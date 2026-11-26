@@ -178,7 +178,7 @@ mod stubs {
         place(&c)
     }
 
-    std::thread_local! {
+    victory_gpu::fast_local! {
         /// Calls in progress on this thread: return address, stub number, start, stack at entry.
         static CALLS: RefCell<Vec<(u64, u64, u64, u64)>> = const { RefCell::new(Vec::new()) };
     }

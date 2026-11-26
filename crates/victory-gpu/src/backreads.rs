@@ -224,7 +224,7 @@ fn marked(page: usize) -> bool {
     TRACKED[word].load(Relaxed) & b != 0
 }
 
-thread_local! {
+crate::fast_local! {
     /// Which reader of ours this thread is now, and for which copy.
     static AS: Cell<(u8, u64)> = const { Cell::new((OTHER, 0)) };
 }

@@ -536,7 +536,7 @@ fn worker() {
 }
 
 #[cfg(windows)]
-thread_local! {
+crate::fast_local! {
     /// This thread is inside [`release_held_now`].
     static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1314,9 +1314,11 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]
-    crate::copystat::present_begins();
-    #[cfg(all(windows, feature = "diagnostics"))]
-    crate::profile::frame();
+    {
+        let _span = crate::trace::span("present: diagnostics' frame start");
+        crate::copystat::present_begins();
+        crate::profile::frame();
+    }
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
@@ -1347,12 +1349,14 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
+        let _span = crate::trace::span("present: run what queues hold");
         release_held_now(false);
     }
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
     if !sent_behind {
+        let _span = crate::trace::span("present: run what queues still hold");
         release_held(forces());
     }
     #[cfg(windows)]
@@ -1396,6 +1400,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
+        let _span = crate::trace::span("present: captures");
         crate::capture::frame_drew(frame, crate::draw::drawn());
         crate::renderdoc::frame_drew(frame, crate::draw::drawn());
         crate::shot::present(frame, crate::draw::drawn());

@@ -138,7 +138,7 @@ static KNOWN_THREADS: [Known; KNOWN] = [const {
 const SUBMITS: u64 = 8;
 const LIST_CALLS: u64 = 64;
 
-thread_local! {
+crate::fast_local! {
     /// This thread's place in [`KNOWN_THREADS`], plus one; 0 before it has
     /// one, 255 if there was none left.
     static MINE: Cell<u8> = const { Cell::new(0) };

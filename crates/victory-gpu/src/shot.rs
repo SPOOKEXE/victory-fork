@@ -338,7 +338,7 @@ pub(crate) fn keeping_lines() -> bool {
     recording() && LINES.load(Relaxed)
 }
 
-thread_local! {
+crate::fast_local! {
     /// The timestamp [`stamp`] recorded for the line this thread is about
     /// to give to [`line`].
     static STAMP: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };

@@ -298,7 +298,7 @@ fn block_class(size: usize) -> usize {
 /// thread on the same counters was 10 % of the submitting thread's time in
 /// a profile, the cache line passed from core to core).
 fn own(size: usize, made: bool) {
-    std::thread_local! {
+    crate::fast_local! {
         static HERE: std::cell::Cell<([i64; 8], u32)> = const { std::cell::Cell::new(([0; 8], 0)) };
     }
     let class = block_class(size);
@@ -388,7 +388,7 @@ mod sites {
     static SITE_OF: [AtomicU32; SAMPLED] = [const { AtomicU32::new(0) }; SAMPLED];
     static SIZE_OF: [AtomicU64; SAMPLED] = [const { AtomicU64::new(0) }; SAMPLED];
 
-    std::thread_local! {
+    crate::fast_local! {
         static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
@@ -1188,7 +1188,7 @@ struct Submitter {
 static SUBMITTERS: Mutex<Vec<(u32, Submitter)>> = Mutex::new(Vec::new());
 static RECORDERS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
 
-thread_local! {
+crate::fast_local! {
     /// This thread's last submission: when it returned ([`now_us`]) and the
     /// thread's processor time then (user, kernel).
     static LEFT: std::cell::Cell<Option<(u64, u64, u64)>> = const { std::cell::Cell::new(None) };

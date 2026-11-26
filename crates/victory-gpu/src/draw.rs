@@ -57,7 +57,7 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
-thread_local! {
+crate::fast_local! {
     /// While a draw is prepared (`State::bind`, then its targets' states):
     /// the depth target the draw only tests (0: none, or one it writes),
     /// and whether a view its shaders read is of that same texture.
@@ -628,7 +628,7 @@ impl State {
 static TABLES: [AtomicU64; 26] = [const { AtomicU64::new(0) }; 26];
 
 #[cfg(feature = "diagnostics")]
-thread_local! {
+crate::fast_local! {
     /// This thread's counts for [`TABLES`] not yet added to it, and its
     /// calls of [`State::tables`] since they last were.
     static TALLY: std::cell::RefCell<([u64; 26], u32)> = const { std::cell::RefCell::new(([0; 26], 0)) };

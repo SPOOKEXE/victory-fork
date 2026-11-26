@@ -224,7 +224,7 @@ pub(crate) fn thread_group(tid: u32) -> Option<String> {
 /// The calling thread presents frames: it is the title's render thread
 /// (taken out of "title threads"). Once per thread.
 pub(crate) fn render_thread() {
-    thread_local! {
+    crate::fast_local! {
         static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     if DONE.replace(true) {
@@ -251,7 +251,7 @@ pub(crate) fn thread_name(tid: u32, name: &str) {
 /// for the card's). Gathered per thread and handed over 128 at a time:
 /// thousands a frame from seven threads into one lock was a wait of its own.
 pub(crate) fn span(name: &'static str, tid: u32, start: u64, ns: u64) {
-    thread_local! {
+    crate::fast_local! {
         static HERE: std::cell::RefCell<Vec<(&'static str, u32, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     HERE.with(|here| {

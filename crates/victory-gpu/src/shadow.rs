@@ -3822,7 +3822,7 @@ impl Shadow {
     /// are stored there and noted for the card. False with nothing done if
     /// title memory could not be read whole (the caller copies as before).
     fn copy_changed(&self, from: usize, to: usize) -> bool {
-        thread_local! {
+        crate::fast_local! {
             static NOW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let (start, n) = (self.start as usize, to - from);
@@ -4386,7 +4386,7 @@ const FOUND_MOST: usize = 8192;
 
 type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
 
-thread_local! {
+crate::fast_local! {
     /// What this thread's asks found, and the count of table changes they
     /// are from.
     static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));

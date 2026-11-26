@@ -21,6 +21,7 @@ mod backreads;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+pub mod fastlocal;
 pub mod clock;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;

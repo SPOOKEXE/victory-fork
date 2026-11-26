@@ -67,7 +67,7 @@ pub(crate) fn on() -> bool {
 }
 
 fn thread() -> u32 {
-    thread_local! {
+    crate::fast_local! {
         static ID: u32 = {
             #[cfg(windows)]
             // SAFETY: a plain query.

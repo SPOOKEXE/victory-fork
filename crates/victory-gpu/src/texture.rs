@@ -467,7 +467,7 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     out
 }
 
-thread_local! {
+crate::fast_local! {
     /// Room to read a texture's memory into: one buffer per submitting
     /// thread. Each texture kept its own, a second copy in memory of every
     /// write-watched or partly mapped texture ever sampled, for the run.
@@ -1310,7 +1310,7 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// through the kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     const WINDOW: usize = 16 << 10;
-    thread_local! {
+    crate::fast_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let len = len as usize;
