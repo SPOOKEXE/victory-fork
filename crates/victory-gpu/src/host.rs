@@ -1328,6 +1328,44 @@ fn crumb(list: &ID3D12GraphicsCommandList, value: u32) {
     }
 }
 
+/// What the breadcrumbs say after `what` did not finish: the raw words, the
+/// list their mark names (found by its mark among the host lists with
+/// breadcrumbs on), its pipelines, and with the commands noted
+/// (`VICTORY_D3D12_DRED=1`) the commands around where the card stopped.
+#[cfg(feature = "diagnostics")]
+fn crumbs_report(what: &str) {
+    let Some((begun, done)) = crumbs_read(false) else {
+        tracing::error!("{what} has not finished in 2 s (VICTORY_CRUMBS=1 would say where)");
+        return;
+    };
+    tracing::error!(
+        "breadcrumbs: {what} has not finished in 2 s; words {begun:#010x} begun, {done:#010x} done \
+         (0xfff1: our send-and-hash list, 0xfff2: our compare list, low 0xfffe: a list just started)"
+    );
+    let lists = CRUMB_LISTS.lock().unwrap_or_else(|e| e.into_inner());
+    // (A list in the table is alive: its drop takes it out under this lock.)
+    let Some(list) = lists.as_ref().and_then(|m| m.get(&(begun >> 16)).copied()).map(|at| unsafe { &*(at as *const HostList) })
+    else {
+        tracing::error!("breadcrumbs: no host list has mark {:#x}", begun >> 16);
+        return;
+    };
+    let pipelines = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    tracing::error!("breadcrumbs: list {:#x}, its pipelines: {pipelines:?}", begun >> 16);
+    let notes = list.notes.lock().unwrap_or_else(|e| e.into_inner());
+    let (begun, done) = (begun & 0xffff, if done >> 16 == begun >> 16 { done & 0xffff } else { 0 });
+    if begun == 0xfffe {
+        tracing::error!("breadcrumbs: the list had begun and none of its noted commands had");
+        return;
+    }
+    let from = done.min(begun).saturating_sub(2) as usize;
+    let to = (begun as usize).saturating_add(2).min(notes.len().saturating_sub(1));
+    for k in from..=to {
+        if let Some((text, range)) = notes.get(k) {
+            tracing::error!("breadcrumbs: command {k}: {text} (reads {range:x?})");
+        }
+    }
+}
+
 /// The two breadcrumbs (begun, all before done), set to `u32::MAX` first.
 #[cfg(feature = "diagnostics")]
 fn crumbs_read(reset: bool) -> Option<(u32, u32)> {
@@ -3991,6 +4029,15 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
+                        // A flight the card has not finished in two seconds
+                        // has most likely faulted it: the breadcrumbs say
+                        // where, before the wait that may never end.
+                        #[cfg(feature = "diagnostics")]
+                        if WaitForSingleObject(event, 2_000) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                            crumbs_report(&format!("a flight sent ahead (fence value {target})"));
+                            WaitForSingleObject(event, INFINITE);
+                        }
+                        #[cfg(not(feature = "diagnostics"))]
                         WaitForSingleObject(event, INFINITE);
                     })
                 };
