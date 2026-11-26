@@ -202,9 +202,11 @@ pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
     out
 }
 
-/// Whether the form with barriers inside branches may be used here.
+/// Whether the form with the halves meeting inside branches is tried before the
+/// approximate forms: by default (`VICTORY_WAVE_WIDE` unset or `1`), or for a program on
+/// `VICTORY_WAVE_WIDE_ONLY`'s list; not with `VICTORY_WAVE_WIDE=last` or `0`.
 fn wave_wide_here() -> bool {
-    WIDE_HERE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+    WIDE_HERE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v == "1")
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -473,17 +475,17 @@ pub fn emit(
                 }
             }
         }
-        // Before the approximate forms only when asked for (`VICTORY_WAVE_WIDE=1`, or the
-        // program on `VICTORY_WAVE_WIDE_ONLY`'s list): runs 121-124 lost the card with it in
-        // a submission of two programs that had just moved to it (`ptfx_CS_lightAtlas_Sprite`
-        // and `_Trail`), when its halves met at group barriers.
+        // Before the approximate forms by default ([`wave_wide_here`]): exact where they give
+        // each half its own answer (lighting, shadow and reflection programs came out wrong
+        // in those). Its halves meet on their own ([`lower::pair_meet_on`]), so halves that
+        // meet unevenly cannot hang the card (runs 121-124 lost it with this form in
+        // `ptfx_CS_lightAtlas_Sprite` and `_Trail` when the halves met at group barriers).
         let wide_on = wave_wide_here();
-        // By default (or `VICTORY_WAVE_WIDE=last`) the same form, but only for programs that
-        // every other form below leaves at 64 lanes (on a 32-lane host those are refused
-        // outright), so the programs the approximate forms already take keep their
-        // barrier-free form. Its halves meet on their own then ([`lower::pair_meet_on`]):
-        // halves that meet unevenly cannot hang the card. `VICTORY_WAVE_WIDE=0`: never.
-        let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
+        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
+        // the programs the approximate forms take keep their barrier-free form.
+        // `VICTORY_WAVE_WIDE=0`: never.
+        let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
