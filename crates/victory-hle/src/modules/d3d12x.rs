@@ -62,6 +62,17 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Frames the title has begun.
+pub fn frames_begun() -> u64 {
+    victory_gpu::frame::current()
+}
+
+/// Makes pipelines earlier runs needed, before the title runs.
+pub fn precompute_pipelines() {
+    #[cfg(windows)]
+    victory_gpu::pipeline::precompute();
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

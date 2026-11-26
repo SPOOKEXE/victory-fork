@@ -532,7 +532,6 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
 fn log_memory_map() {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_WRITECOMBINE,
-        VirtualQuery,
     };
     const KINDS: [&str; 10] = [
         "the title's heaps (private, console addresses)",
@@ -559,7 +558,7 @@ fn log_memory_map() {
         // SAFETY: plain data filled in by the query.
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        if unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } == 0 {
+        if unsafe { crate::native::Query(at as *const _, &mut m, size_of_val(&m)) } == 0 {
             break;
         }
         if m.State != MEM_FREE {
@@ -889,10 +888,9 @@ fn log_memory() {
     );
 }
 
-/// Microseconds since the first call.
+/// Microseconds since the first call to [`crate::clock`].
 fn now_us() -> u64 {
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+    crate::clock::now_us()
 }
 
 /// When the last frame was presented and when the last submission returned
@@ -1343,11 +1341,11 @@ pub(crate) fn log(frames: f64) {
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
     for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
-        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
+        unsafe { crate::native::Query(src as *const _, &mut info, size_of_val(&info)) };
         let kind = info.Type;
         tracing::info!(
             "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",

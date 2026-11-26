@@ -171,6 +171,9 @@ fn virtual_alloc(
             constrained.into(),
         )
     };
+    if kind & MEM_RESERVE_PLACEHOLDER != 0 && !at.is_null() {
+        victory_gpu::native::placeholder(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -368,7 +371,22 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// The pages of one allocation: a section, or under Wine a memory file of
+/// the host system (`victory_gpu::native`).
+enum Section {
+    Host(HANDLE),
+    Native(victory_gpu::native::Pool),
+}
+
+impl Section {
+    /// What the GPU side knows the section by.
+    fn key(&self) -> usize {
+        match self {
+            Section::Host(handle) => *handle as usize,
+            Section::Native(pool) => pool.key(),
+        }
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -377,8 +395,10 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
-        // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        if let Section::Host(handle) = self {
+            // SAFETY: our handle; views keep the section alive on their own.
+            unsafe { CloseHandle(*handle) };
+        }
     }
 }
 
@@ -437,6 +457,42 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
+    let Some(section) = make_section(size) else {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    };
+    tracing::debug!(
+        n,
+        flags = format_args!("{flags:#x}"),
+        "XMemAllocatePhysicalPages"
+    );
+    let section = Arc::new(section);
+    let mut physical = physical();
+    let first = physical.next_page;
+    physical.next_page += n * FRAMES;
+    for index in 0..n {
+        let slice = Slice {
+            section: section.clone(),
+            index,
+        };
+        let number = first + index * FRAMES;
+        physical.pages.insert(number, slice);
+        // SAFETY: the title passes room for `n` page numbers.
+        unsafe { pages.add(index).write(number) };
+    }
+    1
+}
+
+/// Memory for `size` bytes of physical pages.
+fn make_section(size: usize) -> Option<Section> {
+    if victory_gpu::native::on() {
+        let pool = victory_gpu::native::Pool::new(size)?;
+        victory_gpu::title_memory_section(pool.key(), size as u64, false);
+        return Some(Section::Native(pool));
+    }
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -456,35 +512,12 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         )
     };
     if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+        return None;
     }
-    tracing::debug!(
-        n,
-        flags = format_args!("{flags:#x}"),
-        "XMemAllocatePhysicalPages"
-    );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
-    }
-    1
+    Some(Section::Host(handle))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -510,6 +543,8 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    /// The section, where the view is part of a lasting view of all of it.
+    of: Option<Arc<Section>>,
 }
 
 impl View {
@@ -517,10 +552,17 @@ impl View {
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        let handle = match &*slice.section {
+            Section::Host(handle) => *handle,
+            Section::Native(pool) => {
+                let at = MEMORY_MAPPED_VIEW_ADDRESS { Value: pool.at(offset as usize).cast() };
+                return Some(View { at, len, of: Some(slice.section.clone()) });
+            }
+        };
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -530,7 +572,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, of: None };
         commit(at.Value as usize, len).then_some(view)
     }
 
@@ -545,8 +587,10 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        if self.of.is_none() {
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(self.at) };
+        }
     }
 }
 
@@ -800,6 +844,24 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     use victory_gpu::framelog::{T, add};
     let started = std::time::Instant::now();
+    let handle = match &*slice.section {
+        Section::Host(handle) => *handle,
+        Section::Native(pool) => {
+            if !pool.show(base, len, slice.index * PAGE) {
+                tracing::warn!(address = format_args!("{base:#x}"), len, "mapping physical pages failed");
+                return false;
+            }
+            victory_gpu::title_memory_remapped(base, len);
+            // A view a page: nothing is ever cut out of a longer one.
+            for k in 0..len.div_ceil(PAGE) {
+                let (at, index) = (base + k * PAGE, slice.index + k);
+                victory_gpu::title_memory_view(at, PAGE, pool.key(), (index * PAGE) as u64);
+                physical.shown.entry(slice.key(k)).or_default().push(at);
+                physical.views.insert(at, (PAGE, Slice { section: slice.section.clone(), index }));
+            }
+            return true;
+        }
+    };
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -810,7 +872,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -842,7 +904,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.key(), (slice.index * PAGE) as u64);
     add(T::RemapNotesUs, committed.elapsed().as_micros() as u64);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
@@ -921,6 +983,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    let mut native = false;
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -939,6 +1002,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         victory_gpu::title_memory_remapped(at, size);
         let noted = std::time::Instant::now();
         add(T::RemapNotesUs, (noted - started).as_micros() as u64);
+        if let Section::Native(_) = &*slice.section {
+            native = true;
+            continue;
+        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -964,6 +1031,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
         }
+    }
+    if native {
+        victory_gpu::native::hide(base, len);
     }
 }
 

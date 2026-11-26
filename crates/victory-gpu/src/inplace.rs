@@ -138,7 +138,9 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
+    // View memory: known from the runtime without asking Windows. (Opened
+    // through the layer's own page views, at the title's address or at the
+    // pool's lasting view, the card faulted, Xid 13, when the view turned.)
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
@@ -499,6 +501,12 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     if offset + bytes.len() as u64 > section_bytes {
         return None;
     }
+    if crate::native::on() {
+        // The section is known by where the runtime's lasting view of it is.
+        // SAFETY: bytes inside that view, checked above.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (section + offset as usize) as *mut u8, bytes.len()) };
+        return Some(shown);
+    }
     let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
     let view = own
         .get_or_insert_with(Default::default)
@@ -594,7 +602,7 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    let n = unsafe { crate::native::Query(at as *const c_void, &mut info, size_of_val(&info)) };
     n != 0
         && info.State == mem::MEM_COMMIT
         && info.Type == mem::MEM_PRIVATE
@@ -1091,7 +1099,7 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    let n = unsafe { crate::native::Query(at as *const c_void, &mut info, size_of_val(&info)) };
     if n == 0 {
         return 5;
     }

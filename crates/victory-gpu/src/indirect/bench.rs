@@ -36,27 +36,7 @@ float4 ps() : SV_Target { return float4(1, 0.5, 0.25, 1); }
 fn compile(entry: &str, target: &str) -> Vec<u8> {
     let entry = std::ffi::CString::new(entry).unwrap();
     let target = std::ffi::CString::new(target).unwrap();
-    let mut code: Option<ID3DBlob> = None;
-    // SAFETY: the source and names outlive the call.
-    unsafe {
-        D3DCompile(
-            SHADERS.as_ptr().cast(),
-            SHADERS.len(),
-            s!("bench"),
-            None,
-            None,
-            PCSTR(entry.as_ptr().cast()),
-            PCSTR(target.as_ptr().cast()),
-            0,
-            0,
-            &mut code,
-            None,
-        )
-        .unwrap();
-        let code = code.unwrap();
-        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-            .to_vec()
-    }
+    crate::hlsl::compile(SHADERS, PCSTR(entry.as_ptr().cast()), PCSTR(target.as_ptr().cast())).unwrap()
 }
 
 /// The clamp as it was before it charged the budget once per group

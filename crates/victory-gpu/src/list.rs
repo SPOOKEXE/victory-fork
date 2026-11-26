@@ -782,6 +782,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+            list.barrier_passed();
         }
     }
     0
@@ -1990,12 +1991,58 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// Whether a set of enhanced barriers orders a shader's writes: one of them
+/// is behind unordered access, or lets it begin on a buffer (or on anything)
+/// that shaders read. The others (render targets and depth to reads, memory
+/// handed from one resource to another) are between uses the host's own
+/// texture states separate, or of resources that share no memory on the host.
+/// A set that cannot be read does. `VICTORY_BARRIERS_ALL=1`: every one.
+///
+/// # Safety
+/// `groups` must be `count` groups as the title passes them (or null).
+#[cfg(windows)]
+unsafe fn orders_shader_writes(groups: *const u8, count: u32) -> bool {
+    #[repr(C)]
+    struct Group {
+        kind: u32,
+        count: u32,
+        barriers: *const u32,
+    }
+    /// In both kinds' barriers and the global ones: sync before and after,
+    /// then access before and after.
+    const ACCESS: usize = 2;
+    const UNORDERED: u32 = 0x10;
+    const READ: u32 = 0x80;
+    const TEXTURE: u32 = 1;
+    /// Dwords of a global, a texture and a buffer barrier.
+    const SIZE: [usize; 3] = [4, 18, 10];
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if groups.is_null() || *ALL.get_or_init(|| std::env::var_os("VICTORY_BARRIERS_ALL").is_some_and(|v| v == "1")) {
+        return count > 0;
+    }
+    // SAFETY: the caller's.
+    let groups = unsafe { std::slice::from_raw_parts(groups.cast::<Group>(), count as usize) };
+    groups.iter().any(|g| {
+        let Some(&size) = SIZE.get(g.kind as usize).filter(|_| !g.barriers.is_null()) else {
+            return true;
+        };
+        (0..g.count as usize).any(|k| {
+            // SAFETY: the group's own barriers.
+            let (before, after) = unsafe {
+                let b = g.barriers.add(k * size);
+                (b.add(ACCESS).read(), b.add(ACCESS + 1).read())
+            };
+            before & UNORDERED != 0 || (after & UNORDERED != 0 && before & READ != 0 && g.kind != TEXTURE)
+        })
+    })
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2005,6 +2052,9 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         }
     }
     #[cfg(windows)]
+    // SAFETY: the title passes `count` groups.
+    let count = if unsafe { orders_shader_writes(groups, count) } { count } else { 0 };
+    #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
@@ -2013,9 +2063,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.barrier_passed();
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

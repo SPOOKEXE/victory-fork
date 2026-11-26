@@ -592,7 +592,8 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    let library = library();
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -611,6 +612,17 @@ pub(crate) fn save(now: bool) {
     // of the library again: run 60's second save).
     let bytes = {
         let _all = one_call();
+        let Some(library) = library else {
+            // A host without pipeline libraries (vkd3d-proton with its own
+            // disk cache) still gets the list of what to start early.
+            if USED_CHANGED.swap(false, Ordering::Relaxed) {
+                let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+                if let Err(e) = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+                    tracing::warn!(error = %e, "early pipeline list not saved");
+                }
+            }
+            return;
+        };
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
@@ -722,6 +734,36 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
+}
+
+/// The folder of the containers of compute programs a run dispatched, from
+/// which the next makes their pipelines before the title runs.
+fn compute_dir() -> Option<PathBuf> {
+    DIR.get().map(|d| d.join("compute"))
+}
+
+/// Keeps a dispatched compute program's container for the next run.
+pub(crate) fn keep_compute(hash: &str, container: &[u8]) {
+    let Some(dir) = compute_dir() else { return };
+    let file = dir.join(hash).with_extension("cdxil");
+    if !file.exists() {
+        let written = std::fs::create_dir_all(&dir).and_then(|()| write_atomically(&file, container));
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "a compute program not kept for the next run");
+        }
+    }
+}
+
+/// The containers kept by [`keep_compute`].
+pub(crate) fn kept_compute() -> Vec<Vec<u8>> {
+    let files = compute_dir().and_then(|d| std::fs::read_dir(d).ok());
+    files
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|f| f.path().extension().is_some_and(|e| e == "cdxil"))
+        .filter_map(|f| std::fs::read(f.path()).ok())
+        .collect()
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.

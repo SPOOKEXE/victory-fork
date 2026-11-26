@@ -3835,6 +3835,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !crate::indirect::direct()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3879,9 +3880,11 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+        let direct = crate::indirect::direct();
         // A record that misses its window: a slot the list's prelude fills,
-        // if the list still gathers ([`gathers`]).
-        let gathered = if hit.is_none() && windowed && gathers() {
+        // if the list still gathers ([`gathers`]). Not with the title's own
+        // arguments read directly ([`crate::indirect::direct`]).
+        let gathered = if hit.is_none() && windowed && !direct && gathers() {
             let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
             #[cfg(feature = "diagnostics")]
             WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3890,6 +3893,17 @@ impl State {
             None
         };
         let (bounded, at) = match (hit, gathered) {
+            _ if direct => {
+                args.refresh(list, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
+                if !crate::indirect::ready(list) {
+                    why("no scratch buffer");
+                    return false;
+                }
+                (args.buffer.clone(), offset)
+            }
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).

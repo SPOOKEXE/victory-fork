@@ -122,6 +122,7 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    victory_hle::modules::d3d12x::precompute_pipelines();
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -131,11 +132,37 @@ pub fn run(
     Ok(())
 }
 
+/// Prints every thread's stack when the title has begun no frame for
+/// `VICTORY_STALL_STACKS` seconds (12; 0: never), once a stall.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_stacks_of_a_stall() {
+    use std::time::{Duration, Instant};
+    let seconds = std::env::var("VICTORY_STALL_STACKS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+    if seconds == 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        let (mut frame, mut since, mut said) = (0, Instant::now(), false);
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = victory_hle::modules::d3d12x::frames_begun();
+            if now != frame {
+                (frame, since, said) = (now, Instant::now(), false);
+            } else if frame > 0 && !said && since.elapsed() > Duration::from_secs(seconds) {
+                said = true;
+                eprintln!("no frame begun after {frame} for {seconds} s: every thread's stack follows");
+                victory_loader::dump_stacks();
+            }
+        }
+    });
+}
+
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    dump_stacks_of_a_stall();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those

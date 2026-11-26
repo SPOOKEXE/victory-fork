@@ -105,7 +105,7 @@ pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var_os("VICTORY_CARD_METER") {
         Some(v) => v != "0",
-        None => cfg!(feature = "diagnostics"),
+        None => cfg!(feature = "diagnostics") || crate::trace::on(),
     })
 }
 
@@ -343,6 +343,11 @@ pub(crate) fn collect() {
         return;
     };
     let now = std::time::Instant::now();
+    // For the frame graph: the card's clock on ours, at this moment.
+    let calibration = crate::trace::on()
+        .then(|| crate::host::host().and_then(|h| h.clock_calibration()))
+        .flatten()
+        .map(|(gpu, cpu)| (gpu, crate::clock::from_qpc(cpu)));
     while let Some(&(pair, kind, at)) = m.pending.front() {
         if now.duration_since(at) < AFTER {
             break;
@@ -362,6 +367,18 @@ pub(crate) fn collect() {
         // card: for the gaps between lists.
         if !matches!(kind, Kind::Pipeline) && begin != 0 && end > begin {
             m.spans.push((begin, end));
+        }
+        if let Some((gpu, ours)) = calibration
+            && us > 0
+        {
+            let back = (gpu.saturating_sub(begin) as u128 * 1_000_000_000 / u128::from(m.frequency)) as u64;
+            let name = match kind {
+                Kind::Sync => "our send-and-hash list",
+                Kind::Check => "our compare list",
+                Kind::Lists => "list",
+                Kind::Pipeline => "pipeline",
+            };
+            crate::trace::card(name, ours.saturating_sub(back), us * 1_000);
         }
         use crate::framelog::{T, add};
         match kind {

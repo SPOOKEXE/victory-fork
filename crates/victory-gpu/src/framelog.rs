@@ -113,11 +113,20 @@ pub enum T {
     RemapNotesUs,
     RemapCuts,
     RemapCutBytes,
+    /// Our submissions' mirror of descriptors the title wrote into placed
+    /// heaps, and the sweep that lets idle host objects go (overlay).
+    HeapSyncUs,
+    SweepUs,
     Count,
 }
 
 const N: usize = T::Count as usize;
 static TOTAL: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+/// Every total now (by `T` index), for the overlay.
+pub(crate) fn totals() -> Vec<u64> {
+    TOTAL.iter().map(|t| t.load(Relaxed)).collect()
+}
 
 /// Adds to a total.
 pub fn add(t: T, n: u64) {
@@ -560,7 +569,12 @@ const LONG_MOST: usize = 8;
 /// A frame ends: called at the end of the title's present call, on the
 /// thread that made it.
 pub fn frame() {
+    crate::trace::frame();
+    crate::overlay::frame();
     if !on() {
+        if crate::trace::on() {
+            crate::cardmeter::collect();
+        }
         return;
     }
     crate::cardmeter::collect();

@@ -96,8 +96,7 @@ static RECENT: [std::sync::atomic::AtomicUsize; 1024] = [const { std::sync::atom
 static EMPTIED: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    crate::clock::now_ms()
 }
 
 /// The numbers of the first and last 64 KiB block of `[from, from + len)`,
@@ -195,6 +194,13 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     }
     if faulted_lately(from as usize, len) {
         COUNT[3].fetch_add(1, Relaxed);
+        return false;
+    }
+    // A page view known to show nothing: the copy would fault (an exception
+    // through Wine for each, some hundreds a frame while the world loads).
+    if crate::native::hidden_within(from as usize, len) {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
         return false;
     }
     let whole = guarded(to, from, len);

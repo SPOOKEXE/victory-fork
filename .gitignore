@@ -55,6 +55,8 @@
 *.ktx2
 *.dxbc
 *.dxil
+/crates/victory-gpu/src/hlsl/dxil/
+vkd3d-proton.cache*
 *.cso
 *.spv
 *.wav

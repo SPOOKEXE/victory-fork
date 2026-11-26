@@ -737,7 +737,8 @@ mod tests {
     use windows::core::{Interface, s};
 
     use super::*;
-    use crate::host::{compile, transition, warp_adapter};
+    use crate::hlsl::compile;
+    use crate::host::{transition, warp_adapter};
 
     const SIDE: u32 = 1024;
     const LEVELS: u16 = 11;

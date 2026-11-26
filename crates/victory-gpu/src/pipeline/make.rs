@@ -40,6 +40,9 @@ pub(crate) struct Pending {
     /// ([`for_formats`]): a chain from the title's pipeline, one link per
     /// set of formats met, never shortened.
     variant: OnceLock<Arc<Pending>>,
+    /// A wait for it ran out of budget: it takes long, and later frames go
+    /// on without it until it is made.
+    late: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -47,6 +50,9 @@ pub(crate) struct Pending {
 unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
+
+/// A pipeline that took longer to make is named in the log.
+const SLOW: Duration = Duration::from_secs(2);
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
@@ -65,12 +71,29 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            late: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            let began = Instant::now();
+            // A panic in the translator costs its pipeline, not the worker
+            // and everything that waits for it.
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            }));
+            let made = made.unwrap_or_else(|_| {
+                tracing::warn!(shaders = ?self.shaders, "making a host pipeline panicked: its draws are dropped");
+                None
+            });
+            let took = began.elapsed();
+            if took > SLOW {
+                let bytes: usize = self.shaders.iter().filter_map(|s| s.translated().map(|t| t.host.dxil.len())).sum();
+                tracing::info!(shaders = ?self.shaders, seconds = took.as_secs_f32(), bytes, "a slow host pipeline");
+            }
+            made
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -131,6 +154,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        if let ([shader], None) = (&p.shaders[..], &p.graphics)
+            && shader.stage == "compute"
+        {
+            super::library::keep_compute(&shader.hash, &shader.container);
+        }
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
@@ -203,10 +231,74 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
+/// Other compute pipelines, which take a driver longest (seconds each), are
+/// made when the workers have nothing else to do (`VICTORY_SPARE_PIPELINES=0`:
+/// at their first use).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.shaders.is_empty() {
+        return;
+    }
+    if super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
+    } else if p.graphics.is_none()
+        && p.shaders[0].stage == "compute"
+        && std::env::var_os("VICTORY_SPARE_PIPELINES").is_none_or(|v| v != "0")
+    {
+        start(p, SPARE);
+    }
+}
+
+/// With no pipeline made for this long, [`precompute`] waits no more.
+const STUCK: Duration = Duration::from_secs(40);
+
+/// Compute pipelines made before the title ran, by key.
+static PREPARED: Mutex<Option<std::collections::HashMap<String, Arc<Pending>>>> = Mutex::new(None);
+
+/// What the title's pipeline of `shaders` is made from: one made before the
+/// title ran, if it is among them.
+pub(crate) fn pending(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Arc<Pending> {
+    let p = Pending::new(shaders, graphics);
+    let prepared = PREPARED.lock().unwrap_or_else(|e| e.into_inner());
+    prepared.as_ref().and_then(|m| m.get(&p.key).cloned()).unwrap_or_else(|| Arc::new(p))
+}
+
+/// Makes the compute pipelines earlier runs dispatched, before the title
+/// runs (`VICTORY_PRECOMPUTE=0`: not; `start`: without waiting for them).
+pub(crate) fn precompute() {
+    let mode = std::env::var("VICTORY_PRECOMPUTE").unwrap_or_default();
+    if mode == "0" {
+        return;
+    }
+    let mut made = std::collections::HashMap::new();
+    for code in super::library::kept_compute() {
+        let p = Arc::new(Pending::new(vec![super::shader("compute", &code)], None));
+        if super::library::wanted_early(&p.key) {
+            start(&p, EARLY);
+            made.insert(p.key.clone(), p);
+        }
+    }
+    let all: Vec<_> = made.values().cloned().collect();
+    *PREPARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(made);
+    if mode == "start" || all.is_empty() {
+        return;
+    }
+    let began = Instant::now();
+    let mut last = (0, Instant::now());
+    loop {
+        let ready = all.iter().filter(|p| p.made.get().is_some()).count();
+        println!("shaders        {ready} of {} ready, {} s", all.len(), began.elapsed().as_secs());
+        if ready == all.len() {
+            return;
+        }
+        if ready > last.0 {
+            last = (ready, Instant::now());
+        } else if last.1.elapsed() > STUCK {
+            let left: Vec<_> = all.iter().filter(|p| p.made.get().is_none()).map(|p| &p.shaders).collect();
+            tracing::warn!(?left, "the host's compiler does not come back with these pipelines: going on without them");
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
@@ -226,7 +318,7 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
-    if budget.is_zero() {
+    if budget.is_zero() || p.late.load(Ordering::Relaxed) {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -253,6 +345,7 @@ fn wait(p: &Pending, frame: u64) {
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
+            p.late.store(true, Ordering::Relaxed);
             break;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
@@ -279,11 +372,14 @@ fn wait(p: &Pending, frame: u64) {
 }
 
 const NOT_QUEUED: u8 = 0;
-const EARLY: u8 = 1;
-const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+const SPARE: u8 = 1;
+const EARLY: u8 = 2;
+const REQUESTED: u8 = 3;
+const MAKING: u8 = 4;
 
 struct Queue {
+    /// Nothing has asked for these yet; made when there is nothing else to do.
+    spare: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
 }
@@ -291,6 +387,7 @@ struct Queue {
 impl Queue {
     const fn new() -> Self {
         Self {
+            spare: VecDeque::new(),
             early: VecDeque::new(),
             requested: VecDeque::new(),
         }
@@ -304,20 +401,25 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match priority {
+            REQUESTED => self.requested.push_back(p.clone()),
+            EARLY => self.early.push_back(p.clone()),
+            _ => self.spare.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+    /// The next to make; a worker that takes `spares` gets one of those last.
+    fn pop(&mut self, spares: bool) -> Option<Arc<Pending>> {
+        // An entry of a lower queue can have been promoted and claimed already.
+        let unclaimed = |q: &mut VecDeque<Arc<Pending>>, state| {
+            std::iter::from_fn(|| q.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
+        };
+        let p = self
+            .requested
+            .pop_front()
+            .or_else(|| unclaimed(&mut self.early, EARLY))
+            .or_else(|| if spares { unclaimed(&mut self.spare, SPARE) } else { None })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -343,30 +445,40 @@ fn start(p: &Arc<Pending>, priority: u8) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        AVAILABLE.notify_one();
+        // (A spare may only be taken by some of the workers.)
+        if priority == SPARE {
+            AVAILABLE.notify_all();
+        } else {
+            AVAILABLE.notify_one();
+        }
     }
 }
 
-fn next() -> Arc<Pending> {
+/// Workers that make pipelines nothing has asked for.
+const SPARE_WORKERS: usize = 3;
+
+fn next(spares: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(spares) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (half the logical processors, 2 to 16) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 16));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                // (The driver recurses deeply over the biggest programs.)
+                .stack_size(32 << 20)
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -374,7 +486,7 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        next(i < SPARE_WORKERS).make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -479,10 +591,10 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &earlier));
+        assert!(queue.pop(false).is_none());
     }
 }

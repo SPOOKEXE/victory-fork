@@ -948,15 +948,37 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let len = now.len().min(held.len()).min(title.len());
+    let (now, held, title) = (&now[..len], &mut held[..len], &mut title[..len]);
+    // Eight bytes at a time: a byte of the mask is 0xff where the card
+    // changed that byte.
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let mut differs = 0u64;
+    let words = len / 8 * 8;
+    let word = |b: &[u8]| u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    for ((n, h), t) in now[..words].chunks_exact(8).zip(held[..words].chunks_exact(8)).zip(title[..words].chunks_exact_mut(8)) {
+        let (n, h) = (word(n), word(h));
+        let x = n ^ h;
+        if x == 0 {
+            continue;
+        }
+        let was = word(t);
+        let high = (((x & LOW7) + LOW7) | x) & !LOW7;
+        let wrote = (high >> 7) * 0xff;
+        let merged = (was & !wrote) | (n & wrote);
+        differs |= merged ^ was;
+        t.copy_from_slice(&merged.to_ne_bytes());
     }
-    differs != 0
+    let mut tail = 0u8;
+    for i in words..len {
+        if now[i] != held[i] {
+            tail |= now[i] ^ title[i];
+            title[i] = now[i];
+        }
+    }
+    // Where the card changed nothing `held` already equals `now`.
+    held.copy_from_slice(now);
+    differs != 0 || tail != 0
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1166,20 +1188,21 @@ mod relay_tests {
     /// memory and into the reference, and stores nothing else.
     #[test]
     fn the_merge_stores_only_what_the_card_changed() {
-        let held0: Vec<u8> = (0..200u32).map(|i| (i * 5 + 1) as u8).collect();
+        // 203 bytes: whole words and a tail.
+        let held0: Vec<u8> = (0..203u32).map(|i| (i * 5 + 1) as u8).collect();
         let mut now = held0.clone();
-        for at in [0usize, 3, 4, 5, 64, 199] {
+        for at in [0usize, 3, 4, 5, 64, 199, 201] {
             now[at] ^= 0x33;
         }
         // The title wrote other bytes meanwhile, and one the card wrote too.
         let mut title = held0.clone();
-        for at in [1usize, 5, 100] {
+        for at in [1usize, 5, 100, 202] {
             title[at] = 0xee;
         }
         let title0 = title.clone();
         let mut held = held0.clone();
         assert!(merge_piece(&now, &mut held, &mut title));
-        for at in 0..200 {
+        for at in 0..203 {
             if now[at] != held0[at] {
                 assert_eq!((title[at], held[at]), (now[at], now[at]), "the card's byte at {at}");
             } else {
@@ -2125,11 +2148,24 @@ fn changed_runs_wide_on() -> bool {
 /// one by one.
 fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
+    let word = |s: &[u8], i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+    let diff = |i: usize| word(now, i) ^ word(was, i);
+    // A word of the xor with no zero byte: all eight bytes differ.
+    let all_differ = |x: u64| x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080 == 0;
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+        // Equal bytes: 32 at a time, then a word at a time up to the first
+        // byte that differs.
+        while i + 32 <= n && (diff(i) | diff(i + 8) | diff(i + 16) | diff(i + 24)) == 0 {
+            i += 32;
+        }
+        while i + 8 <= n {
+            let x = diff(i);
+            if x != 0 {
+                i += x.trailing_zeros() as usize / 8;
+                break;
+            }
             i += 8;
         }
         while i < n && now[i] == was[i] {
@@ -2139,6 +2175,9 @@ fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             break;
         }
         let first = i;
+        while i + 8 <= n && all_differ(diff(i)) {
+            i += 8;
+        }
         while i < n && now[i] != was[i] {
             i += 1;
         }
@@ -2419,7 +2458,15 @@ mod merge_tests {
     #[test]
     fn changed_runs_are_exactly_the_bytes_that_differ() {
         let was: Vec<u8> = (0..300u32).map(|i| (i * 13 + 5) as u8).collect();
-        for changes in [vec![], vec![0], vec![299], vec![7, 8, 9], vec![7, 9], vec![15, 16, 17, 23, 24, 64, 65, 66, 67, 68, 69, 70, 71, 72, 298, 299]] {
+        for changes in [
+            vec![],
+            vec![0],
+            vec![299],
+            vec![7, 8, 9],
+            vec![7, 9],
+            vec![15, 16, 17, 23, 24, 64, 65, 66, 67, 68, 69, 70, 71, 72, 298, 299],
+            (40..101).chain(130..300).collect(),
+        ] {
             let mut now = was.clone();
             for &at in &changes {
                 now[at] ^= 0x41;

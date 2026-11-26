@@ -50,6 +50,56 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
+### Linux (2026-11-26)
+
+`./run.sh` builds the layer with mingw-w64 and runs the title under Proton
+(Proton - Experimental; an NVIDIA RTX 4090 and a Ryzen 9 9900X here). It needs
+`mingw-w64-gcc`, `gcc`, `rustup` and Proton; `./run.sh --help` lists the
+switches. `native/build-vkd3d.sh` builds the vkd3d-proton it prefers. The first
+start compiles the compute programs earlier runs dispatched (some minutes, kept
+by the driver afterwards).
+
+Every run leaves, under `~/.local/share/victory`: `logs/<run>.log`;
+`traces/<run>.json.gz`, the frame graph (`VICTORY_TRACE`: present, submit
+calls, our submissions' steps, copy-back, settles, sweeps, frame length and
+card memory, and the card's time per list on a track of its own; open it in
+ui.perfetto.dev; `--no-trace` leaves it out); and after a GPU fault (Xid), a
+stall, a device loss or a title crash `crashes/<run>.tar.gz` with the reason,
+the kernel's GPU lines, vkd3d's fault report (`VKD3D_CONFIG=fault`: the
+faulting address and the allocation it hit), the log's errors and tail,
+minidumps and the trace.
+
+| | Before | Now |
+|---|---|---|
+| First world scene | black (Wine's HLSL compiler refused the argument clamp) | lit: lamps, sun, shadow maps, skin, sky |
+| Frame, opening cutscene | 2,000 to 5,000 ms | 90 to 130 ms |
+| Frame, first gameplay (4,800 draws) | not reached | about 100 ms |
+| Longest run | 4 minutes (a card fault or a deadlock) | two of 20 minutes, ended by us |
+| 789 compute pipelines, cold | 332 s, 4 hung | 1,131 in 142 s, none hung |
+
+What did it:
+- The layer's own shaders are compiled beforehand (`crates/victory-gpu/src/hlsl`).
+- Page views are the host system's own (`crates/victory-gpu/src/native.rs`):
+  wineserver walked a list of some 40,000 views at every remap.
+- Indirect commands read the title's argument buffers (`VICTORY_INDIRECT_DIRECT=1`,
+  on in `run.sh`): 46 to 10 ms of the card a frame, and the clamp's budget no
+  longer empties lighting work. Nothing bounds the arguments then.
+- The hash and compare passes over card copies use a group per 64 KiB: 46 to 10 ms.
+- A pipeline that missed its wait once is not waited for again.
+- A title barrier that orders no shader write records none.
+- Memory of the process itself among the title's low addresses is never
+  write-protected: the next allocation faulted under the guards' own lock.
+- Root constant buffers are bounded (`VK_EXT_descriptor_heap` off) and shader
+  loops stop after 16,384 steps: the card faulted or ran on without end.
+- Views in another format of one texel width are copied straight: no buffer between.
+
+Open: 30 frames a second is not reached. A frame is a submit thread of about
+60 ms of its own work, about 65 ms of the card, and about 60 MB fetched back.
+Ray tracing: with `VICTORY_BVH_BUILDER=1 VICTORY_FIRSTLANE_OWN=1` all 53 builder
+programs have pipelines and run, but what they write is wrong (bounding boxes
+over title objects; with `VICTORY_BVH_QUARANTINE=1` the run stands still), so
+bounce light stays off.
+
 ### Newest (2026-11-26, 02:15 UTC)
 
 - **Measured: `VICTORY_LOOKUP_CACHE=1` (pull request #1237) is worth about 14 ms a frame** on the

@@ -168,6 +168,45 @@ pub fn group_sync() -> u8 {
     })
 }
 
+thread_local! {
+    /// The program being translated on this thread is on
+    /// `VICTORY_WAVE_WIDE_ONLY`'s list ([`with_wave_wide`]).
+    static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the program `hash` (the 16 hex digits the GPU side names
+/// programs by) is on `VICTORY_WAVE_WIDE_ONLY=<hash>,...`: the wave64
+/// programs that take the form with group barriers inside branches
+/// (`VICTORY_WAVE_WIDE=1` gives it to all of them, and some hang the card:
+/// a list lets the others run without them).
+pub fn wave_wide_listed(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    })
+    .iter()
+    .any(|h| h == hash)
+}
+
+/// Runs `f` (a translation) with the wide form allowed on this thread or
+/// not ([`wave_wide_listed`]).
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = WIDE_HERE.replace(on);
+    let out = f();
+    WIDE_HERE.set(was);
+    out
+}
+
+/// Whether the form with barriers inside branches may be used here.
+fn wave_wide_here() -> bool {
+    WIDE_HERE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
@@ -424,7 +463,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = wave_wide_here();
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the approximate forms already take keep their barrier-free form.

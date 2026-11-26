@@ -1031,6 +1031,10 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    let mut _span = crate::trace::span("title submit");
+    if let Some(span) = &mut _span {
+        span.arg(u64::from(count));
+    }
     #[cfg(windows)]
     let started = std::time::Instant::now();
     execute_now(this, count, lists);
@@ -1305,6 +1309,7 @@ extern "system" fn present(
 }
 
 fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
+    let _span = crate::trace::span("present");
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]

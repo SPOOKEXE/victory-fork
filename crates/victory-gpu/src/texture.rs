@@ -366,23 +366,33 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     );
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
-    // SAFETY: an open list and live resources; the buffer is as big as
-    // the footprints and rests in the common state between copies.
-    unsafe {
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
-        for (index, (of_written, _)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+    // vkd3d-proton copies between any two formats of one texel width; its
+    // own rules are Vulkan's.
+    let straight = crate::native::on();
+    if straight {
+        for index in 0..through.parts.len() {
+            // SAFETY: an open list and live textures in the copy states.
+            unsafe { list.list.CopyTextureRegion(&part(to, index), 0, 0, 0, &part(from, index), None) };
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
-        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+    } else {
+        // SAFETY: an open list and live resources; the buffer is as big as
+        // the footprints and rests in the common state between copies.
+        unsafe {
             list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+                .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+            for (index, (of_written, _)) in through.parts.iter().enumerate() {
+                list.list
+                    .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+            }
+            list.list
+                .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+            for (index, (_, of_read)) in through.parts.iter().enumerate() {
+                list.list
+                    .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+            }
+            list.list
+                .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
     // A draw that also writes the source (a view of it handled before
@@ -1388,6 +1398,9 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
+    if let Some(there) = crate::native::readable(first, last, all) {
+        return (there, of);
+    }
     let mut there = 0;
     // SAFETY: plain data.
     let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
@@ -1422,14 +1435,14 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
     let mut p = at as usize;
     let end = p + len;
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = unsafe { crate::native::Query(p as *const _, &mut info, size_of_val(&info)) };
         if n == 0 || info.State != MEM_COMMIT {
             return false;
         }
@@ -1445,7 +1458,7 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
     if len == 0 {
         return 0;
     }
@@ -1486,7 +1499,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = unsafe { crate::native::Query(p as *const _, &mut info, size_of_val(&info)) };
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
         if n == 0 || next <= p {
             break;

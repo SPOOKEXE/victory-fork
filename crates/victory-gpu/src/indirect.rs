@@ -29,200 +29,12 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) {
-    uint kind;
-    uint stride;
-    uint records;
-    uint args_offset;
-    // Bit 0: a count buffer bounds the records. Bit 1: the records are a
-    // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing. Bit 2: the records are gathered
-    // (`gather`): record i lies in the source where word i of the table
-    // behind `count_buf` says (from `count_offset` on), and goes to slot i.
-    uint has_count;
-    uint count_offset;
-};
-ByteAddressBuffer src_args : register(t0);
-ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
-// The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
-// The vertices or indices an instance from which a draw record runs empty.
-static const uint MOST_DRAW = 1u << 23;
-// Groups of one dispatch; more run empty.
-static const uint GROUPS = 1u << 20;
-// Each group charges the budget once: the costs of its records go here,
-// one thread charges their sum, saturating as each record would in lane
-// order, and every thread then reads whether its own record fitted. A
-// compare and swap per record, 64 threads racing for one word, cost a
-// round for each record of a window, and in memory the CPU maps (where the
-// budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
-// crosses the bus on a card of its own.
-groupshared uint costs[64];
-groupshared uint fits[64];
-groupshared uint largest_asked;
-groupshared uint all_asked;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    uint eff_count = records;
-    bool ahead = (has_count & 2u) != 0;
-    if ((has_count & 1u) != 0) {
-        eff_count = min(eff_count, count_buf.Load(count_offset));
-    }
-    // Threads past the records take part in the group's charge (cost 0)
-    // and store nothing.
-    bool active = id.x < eff_count;
-    uint src_at = args_offset + id.x * stride;
-    // (A branch, not a select: without the bit the view behind `count_buf`
-    // is a count of four bytes, or the source itself, and is not read here.)
-    [branch]
-    if ((has_count & 4u) != 0) {
-        src_at = count_buf.Load(count_offset + id.x * 4u);
-    }
-    uint dst_at = id.x * stride;
-    uint cost = 0;
-    uint asked = 0;
-    uint2 draw_counts = uint2(0, 0);
-    uint3 groups = uint3(0, 0, 0);
-    if (gi == 0) {
-        largest_asked = 0;
-        all_asked = 0;
-    }
-    if (active && kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint2 want = src_args.Load2(src_at);
-        if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
-            want = uint2(0, 0);
-        }
-        uint count = min(want.x, 1u << 24);
-        uint instances = min(want.y, (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        // A record that asks for MOST_DRAW vertices or indices an instance
-        // or more is no draw of the title's (no mesh of a console title has
-        // 2.8 million triangles): it runs empty and charges nothing. Run
-        // 206's window check found one list with 90 draws of 2^24 vertices
-        // and one instance each. Clamped one draw at a time, the list's
-        // budget lets eight of them run (2^27 in all) and empties the other
-        // 82; served from a window, whose records are charged once however
-        // often they are drawn, all 90 ran: 1.5 thousand million vertices
-        // in one list, with windows on in the runs that lost the device
-        // (201, 204).
-        if (count >= MOST_DRAW) {
-            count = 0;
-            instances = 0;
-            cost = 0;
-        }
-        draw_counts = uint2(count, instances);
-    } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64u;
-        groups = g;
-    } else if (active) {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
-        // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
-            g = uint3(0, 0, 0);
-        }
-        asked = g.x;
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
-        groups = g;
-    }
-    costs[gi] = cost;
-    GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
-        // Diagnostics, in the budget buffer's next words (below): the
-        // largest group count a mesh record asked for, and the groups
-        // asked in all.
-        uint was;
-        InterlockedMax(largest_asked, asked, was);
-        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
-    }
-    // The group's own records: none for a group past a count buffer's
-    // count (an execution may ask for thousands and count a few), which
-    // touches the budget not at all, as its threads did not before.
-    uint first = id.x - gi;
-    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
-    if (gi == 0 && n > 0) {
-        // What the records charge, from `before` on, in lane order: a
-        // record that does not fit whole runs empty and takes the rest.
-        // Only the group's own records are walked (one, clamped alone).
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = before;
-            for (uint j = 0; j < n; j++) {
-                uint c = costs[j];
-                if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
-                }
-            }
-            if (next == before) break;
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        uint at = before;
-        for (uint k = 0; k < n; k++) {
-            uint c = costs[k];
-            uint fit = 1;
-            if (c > 0) {
-                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
-            }
-            fits[k] = fit;
-        }
-    }
-    GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2 && n > 0) {
-        uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
-    }
-    if (!active) {
-        return;
-    }
-    bool over = fits[gi] == 0;
-    if (kind <= 1) {
-        if (over) {
-            draw_counts = uint2(0, 0);
-        }
-        dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
-    } else {
-        if (over) {
-            groups = uint3(0, 0, 0);
-        }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
-    }
-}
-"#;
+const SOURCE: &str = crate::hlsl::CLAMP;
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -259,42 +71,10 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
+    let code = crate::hlsl::compile(source, s!("main"), s!("cs_5_1"))?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes = code.as_slice();
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -372,6 +152,43 @@ pub(crate) fn bound_ahead(
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+}
+
+/// Whether indirect commands read the title's own argument buffers, with no
+/// clamp before them (`VICTORY_INDIRECT_DIRECT=1`). A clamp is a pass of ours
+/// between two waits for every earlier shader write, about 12 microseconds of
+/// the card for each of some thousands of draws a frame; here the card waits
+/// once after each of the title's own barriers. Nothing bounds the arguments
+/// then: a pass of the title's that goes wrong can hang the card.
+pub(crate) fn direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_DIRECT").is_some_and(|v| v == "1"))
+}
+
+/// With [`direct`], before an indirect command: if the list has passed one of
+/// the title's barriers since the last, what shaders wrote before it becomes
+/// readable as indirect arguments.
+pub(crate) fn ready(list: &HostList) -> bool {
+    if !list.arguments_stale() {
+        return true;
+    }
+    let Some(dst) = list.indirect_scratch(16) else { return false };
+    let before = list.indirect_state(&dst);
+    let first = [uav_barrier(), transition(&dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+    let second = [
+        uav_barrier(),
+        transition(&dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+    ];
+    // SAFETY: an open list and its own scratch buffer, in the state it left
+    // it in. On a host that takes buffer states for what they are the
+    // scratch buffer's move makes the write caches' bytes arguments too.
+    unsafe {
+        list.list.ResourceBarrier(&first);
+        list.list.ResourceBarrier(&second);
+    }
+    list.indirect_readable(&dst);
+    list.arguments_read();
+    true
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -780,39 +597,7 @@ pub(crate) fn window_check() -> bool {
 /// the checks and the records that differ in `u0`, keeps the first record
 /// that differs there (eight dwords of each), and zeroes the fresh clamp's
 /// own budget (`u1`) for the next check.
-const CHECK_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
-cbuffer Check : register(b0) {
-    uint words;
-};
-ByteAddressBuffer window_record : register(t0);
-ByteAddressBuffer fresh_record : register(t1);
-RWByteAddressBuffer results : register(u0);
-RWByteAddressBuffer fresh_budget : register(u1);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main() {
-    bool same = true;
-    for (uint i = 0; i < words; i++) {
-        if (window_record.Load(4 * i) != fresh_record.Load(4 * i)) {
-            same = false;
-        }
-    }
-    uint was;
-    results.InterlockedAdd(4, 1, was);
-    if (!same) {
-        uint before;
-        results.InterlockedAdd(0, 1, before);
-        if (before == 0) {
-            for (uint k = 0; k < min(words, 8u); k++) {
-                results.Store(8 + 4 * k, window_record.Load(4 * k));
-                results.Store(40 + 4 * k, fresh_record.Load(4 * k));
-            }
-        }
-    }
-    fresh_budget.Store3(0, uint3(0, 0, 0));
-}
-"#;
+const CHECK_SOURCE: &str = crate::hlsl::WINDOW_CHECK;
 
 fn compare() -> Option<&'static Clamp> {
     static COMPARE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
@@ -995,16 +780,7 @@ mod tests {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
-    const WORKER_CS: &str = r#"
-#define RS "UAV(u0)"
-RWByteAddressBuffer hits : register(u0);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main() {
-    uint prev;
-    hits.InterlockedAdd(0, 1, prev);
-}
-"#;
+    const WORKER_CS: &str = crate::hlsl::TEST_WORKER;
 
     struct WarpHarness {
         device: ID3D12Device,
@@ -1182,38 +958,7 @@ void main() {
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
-            Ok(Clamp { root, pso })
-        }
+        make_from(device, source)
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
@@ -2507,7 +2252,8 @@ mod bare_cost {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::{Interface, s};
 
-    use crate::host::{compile, transition};
+    use crate::hlsl::compile;
+    use crate::host::transition;
 
     /// Draws in a batch.
     const DRAWS: u32 = 10_000;

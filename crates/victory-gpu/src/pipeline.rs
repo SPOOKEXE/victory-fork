@@ -141,7 +141,8 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let wide = victory_shader::emit::wave_wide_listed(&self.hash);
+                let done = victory_shader::emit::with_wave_wide(wide, || translate(&self.container));
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -499,6 +500,13 @@ pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> 
     make::ready(p)
 }
 
+/// Makes the pipelines earlier runs needed and that take long, before the
+/// title runs.
+#[cfg(windows)]
+pub fn precompute() {
+    make::precompute();
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -607,7 +615,7 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::pending(shaders.clone(), graphics);
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]

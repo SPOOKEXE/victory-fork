@@ -21,6 +21,7 @@ mod backreads;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+mod clock;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -49,6 +50,8 @@ mod heap_pass;
 pub mod framelog;
 #[cfg(windows)]
 mod heap_worker;
+#[cfg(windows)]
+mod hlsl;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -80,9 +83,15 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 mod tiles;
+mod trace;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+pub mod native;
+#[cfg(windows)]
+mod overlay;
+
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
@@ -91,6 +100,8 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+#[cfg(windows)]
+pub use overlay::takes_key as overlay_takes_key;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
