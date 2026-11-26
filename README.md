@@ -625,6 +625,17 @@ What did it, on top of the list below:
     The new start alone, freeing at once, lost the card 6 s after its
     first sweep (one run). What goes wrong with a copy made anew is not
     known yet.
+- The title's barriers, measured (RTX 4090, run 2026-11-27): about 860
+  barrier groups a frame order shader writes, each a wait for every
+  earlier shader write here. Left out (`VICTORY_BARRIER_TEST=groups`, a
+  measurement only: work then races) the usual frame went from 97-109 ms
+  to 68-84 and the title's lists on the card from 55-72 ms to 44-56. A
+  census of the barriers in those groups: nearly all are ALL_SHADING
+  (0x1000) on both sides, unordered access before and unordered access or
+  shader reads after (buffer barriers most of them, texture barriers the
+  rest), which is what the wait does already. Passing the title's own
+  scopes to the host's enhanced barriers would win little; what costs is
+  the draining itself.
 - Frame rate, third session: measuring first (same RTX 4070, first room).
   - A frame log (`VICTORY_FRAME_LOG`, on in diagnostics builds): every
     frame's length, and for the usual frame and each long one what it was
