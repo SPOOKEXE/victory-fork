@@ -32,7 +32,8 @@ const DEPTHS: [usize; 4] = [1, 3, 6, usize::MAX];
 static SHOWN: AtomicBool = AtomicBool::new(false);
 /// Which view is up: 0 the processor's spans (F9), 1 the card's time by
 /// pipeline (F10), 2 where the memory is (F8), 3 one frame's spans in order
-/// on a time line, the processor's threads and the card's lists (F7).
+/// on a time line, the processor's threads and the card's lists (F7), 4 the
+/// system (F3), 5 vkd3d-proton's memory allocator (F2).
 static VIEW: AtomicU32 = AtomicU32::new(0);
 /// The first row shown, and the depth.
 static SCROLL: AtomicU32 = AtomicU32::new(0);
@@ -42,9 +43,9 @@ static SCROLL: AtomicU32 = AtomicU32::new(0);
 static ROWS_SEEN: AtomicU32 = AtomicU32::new(0);
 static DEPTH: AtomicU32 = AtomicU32::new(3);
 /// What the processor's spans (F9) and the time line (F7) show, Q and E to
-/// step: 0 the mean frame (F9: the mean per frame; F7: the frame nearest the
-/// mean length), 1 the 90th percentile, 2 the most (F9: the most in one
-/// frame; F7: the longest frame).
+/// step: 0 the mean (F9: the mean per frame; F7: the last frame ready), 1
+/// the 90th percentile, 2 the most (F9: the most in one frame; F7: the
+/// longest frame).
 static MODE: AtomicU32 = AtomicU32::new(0);
 const MODE_NAMES: [&str; 3] = ["MEAN", "P90", "MAX"];
 /// What the card's view (F10) is sorted by, Q and E to step: 0 the time a
@@ -79,11 +80,15 @@ struct State {
     memory_rows: Vec<(&'static str, String, u64, u64)>,
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     memory_at: u64,
+    /// vkd3d-proton's allocator (F2; `crate::vkd3dstat::rows`), taken every
+    /// second while that view is up, and when.
+    vkd3d_rows: Vec<crate::vkd3dstat::Row>,
+    vkd3d_at: u64,
     summed: u32,
     since_ns: u64,
     vram: (u64, u64),
-    /// F9, Up, Down, Left, Right, F10, F8, F7, F1, F3, Q, E as last seen.
-    keys: [bool; 12],
+    /// F9, Up, Down, Left, Right, F10, F8, F7, F1, F3, Q, E, F2 as last seen.
+    keys: [bool; 13],
     /// The time line (F7), kept only while it is up: spans of the last
     /// [`KEEP_NS`] (start ns, length ns, thread group, name), the presents'
     /// times, and the frame laid out at the last half second.
@@ -353,10 +358,12 @@ pub(crate) fn frame() {
         gpu_rows: Vec::new(),
         memory_rows: Vec::new(),
         memory_at: 0,
+        vkd3d_rows: Vec::new(),
+        vkd3d_at: 0,
         summed: 0,
         since_ns: now,
         vram: (0, 0),
-        keys: [false; 12],
+        keys: [false; 13],
         timeline: Default::default(),
         presents: Default::default(),
         laid: None,
@@ -371,15 +378,15 @@ pub(crate) fn frame() {
         // Held now (the high bit), and pressed since the last look (the low
         // bit): at 6 fps the looks are 170 ms apart, and a tap between two
         // of them was never seen (F1 "did nothing").
-        let state = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70, 0x72, 0x51, 0x45].map(|vk| unsafe { GetAsyncKeyState(vk) });
+        let state = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70, 0x72, 0x51, 0x45, 0x71].map(|vk| unsafe { GetAsyncKeyState(vk) });
         let down = state.map(|k| k < 0);
         let tapped = state.map(|k| k & 1 != 0);
         let pressed = |k: usize| (down[k] && !s.keys[k]) || (tapped[k] && !down[k]);
         let front = focused();
         // F9 the processor's view, F10 the card's, F8 the memory's, F7 the
-        // time line: the same key again hides it, another key switches to
-        // its view.
-        for (key, view) in [(0, 0), (5, 1), (6, 2), (7, 3), (9, 4)] {
+        // time line, F3 the system's, F2 vkd3d's allocator: the same key
+        // again hides it, another key switches to its view.
+        for (key, view) in [(0, 0), (5, 1), (6, 2), (7, 3), (9, 4), (12, 5)] {
             if pressed(key) && front {
                 if shown() && VIEW.load(Relaxed) == view {
                     SHOWN.store(false, Relaxed);
@@ -547,6 +554,10 @@ pub(crate) fn frame() {
         if shown() && VIEW.load(Relaxed) == 2 && now - s.memory_at >= 2_000_000_000 {
             s.memory_at = now;
             s.memory_rows = crate::copystat::memory_rows();
+        }
+        if shown() && VIEW.load(Relaxed) == 5 && now - s.vkd3d_at >= 1_000_000_000 {
+            s.vkd3d_at = now;
+            s.vkd3d_rows = crate::vkd3dstat::rows();
         }
         if shown()
             && let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory())
@@ -814,6 +825,13 @@ fn write_snapshot(snap: &Snap, laid: Option<&Laid>, vram: (u64, u64)) {
             let _ = writeln!(md, "| {g} | {} | {:.0} | {count} |", what.trim(), bytes as f64 / f64::from(1u32 << 20));
         }
     }
+    let vkd3d = crate::vkd3dstat::rows();
+    if !vkd3d.is_empty() {
+        let _ = writeln!(md, "\n## vkd3d-proton's memory allocator (rates since the last reading)\n\n| group | what | figure | count |\n|---|---|---:|---:|");
+        for (g, what, v, count, _) in vkd3d {
+            let _ = writeln!(md, "| {g} | {what} | {v:.2} | {count:.0} |");
+        }
+    }
     let _ = writeln!(md, "\n## Machine load over the last second\n\n| what | % |\n|---|---:|");
     for (label, percent) in machine_rows() {
         match percent {
@@ -999,6 +1017,21 @@ pub(crate) fn draw() -> Vec<u32> {
                 }
             }
         }
+    } else if view == 5 {
+        // vkd3d-proton's allocator: each row a bar against what it is
+        // measured by (`crate::vkd3dstat`), its figure and a count.
+        text_at(&mut px, 2, 22, "VKD3D MEMORY, EVERY SECOND (F8: OURS)", HEAD);
+        let mut group = "";
+        for (g, what, v, count, full) in &s.vkd3d_rows {
+            if *g != group {
+                group = g;
+                lines.push((g.to_uppercase(), None));
+            }
+            lines.push((what.to_uppercase(), Some((*v, *count, *full))));
+        }
+        if s.vkd3d_rows.is_empty() {
+            lines.push(("(NEEDS THE VKD3D-PROTON OF NATIVE/BUILD-VKD3D.SH)".to_owned(), None));
+        }
     } else if view == 3 {
         top = draw_timeline(&mut px, s, &mut lines);
     } else if view == 2 {
@@ -1065,7 +1098,7 @@ pub(crate) fn draw() -> Vec<u32> {
         ROWS_SEEN.store(lines.len().saturating_sub(room) as u32, Relaxed);
     }
     // (the card's view: wider names, the shaders' own)
-    let names = if view == 1 || view == 3 || view == 4 { 228 } else { 150 };
+    let names = if view == 1 || view == 3 || view == 4 || view == 5 { 228 } else { 150 };
     // (the processor's and the card's views: a third number, the time a call)
     let numbers_w = if view == 0 || view == 1 { 152 } else { 104 };
     let (bar_x, bar_w) = (names, WIDTH - names - numbers_w);
@@ -1074,7 +1107,7 @@ pub(crate) fn draw() -> Vec<u32> {
         match value {
             None => text_at(&mut px, 2, y, label, HEAD),
             Some((v, count, full)) => {
-                let chars = if view == 3 || view == 4 { 36 } else { 23 };
+                let chars = if view == 3 || view == 4 || view == 5 { 36 } else { 23 };
                 text_at(&mut px, 8, y, &label.chars().take(chars).collect::<String>(), TEXT);
                 let share = v / full.max(1.0);
                 let len = (share.min(1.0) * f64::from(bar_w)) as u32;
@@ -1092,6 +1125,7 @@ pub(crate) fn draw() -> Vec<u32> {
                 }
                 let numbers = match view {
                     2 => format!("{v:7.0}{count:7.0}"),
+                    5 => format!("{v:8.1}{count:8.0}"),
                     // (the time line: the span's length and its share of the frame, %)
                     3 => format!("{v:6.1}{count:5.0}%"),
                     // (the system: per cent)
@@ -1408,7 +1442,7 @@ mod timeline_tests {
         ]
         .into_iter()
         .collect();
-        let laid = super::lay_out(&timeline, &presents, now).expect("a frame");
+        let laid = super::lay_out(&timeline, &presents, now, 0).expect("a frame");
         assert_eq!(laid.ms, 100.0);
         let find = |name| laid.spans.iter().find(|s| s.4 == name).copied().unwrap();
         // (and the title's own work filling its render thread, which has none of ours here)

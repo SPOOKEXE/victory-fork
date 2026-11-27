@@ -85,6 +85,7 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 mod tiles;
+mod vkd3dstat;
 pub mod trace;
 pub mod signature;
 #[cfg(windows)]
