@@ -627,8 +627,13 @@ What did it, on top of the list below:
     passes of 1,000 to 3,200 copies, with every copy let go still kept and
     none made anew or given back, so it follows a large pass whatever is
     done with the copies. A pass now lets go at most 128, the longest
-    unused first: one run of 20 minutes, 85 passes, 10,880 let go, no loss.
-    What the card trips on is not known yet.
+    unused first: one run of 20 minutes, 85 passes, 10,880 let go, no loss;
+    the next lost the card one second after its first passes of 128. And a
+    run with no sweep at all lost it as the boat cutscene ended (a scene
+    change: the title lets many textures go and makes others), so the
+    sweep is one way to the loss, not its cause. With no sweep the card
+    also fills, and textures first used after that are missing (1,602 in
+    that run), so the sweep stays on. Not known yet.
 - The title's barriers, measured (RTX 4090, run 2026-11-27): about 860
   barrier groups a frame order shader writes, each a wait for every
   earlier shader write here. Left out (`VICTORY_BARRIER_TEST=groups`, a
