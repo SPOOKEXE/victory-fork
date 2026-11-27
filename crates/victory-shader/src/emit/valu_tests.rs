@@ -2908,3 +2908,23 @@ fn a_spread_dispatch_runs_each_asked_group_once() {
     eprintln!("ran on {ran:?}");
     assert!(!ran.is_empty(), "no device ran the test");
 }
+
+/// A run of narrowing EXEC masks (the cases of a switch: each case's lanes are the last case's
+/// less those of one more test) costs one `and` per case: the lowering joins each new term to
+/// the older run's value rather than building each case's conjunction anew.
+#[test]
+fn narrowing_masks_cost_one_operation_each() {
+    let arith = |cases: u8| {
+        let mut body = Vec::new();
+        for k in 0..cases {
+            body.push(0x7C00_0000 | 0xC5 << 17 | 1 << 9 | (128 + u32::from(k))); // v_cmp_ne_u32 vcc_lo, k, v1
+            body.push(0xBE94_3C6A); // s_and_saveexec_b32 s20, vcc_lo
+            body.push(vop2(0x25, 0, 0x81, 0)); // v_add_nc_u32 v0, 1, v0
+        }
+        let shader = build_cs(&body, 32, 0);
+        super::bitcode::census::take(&shader.dxil).expect("counted").counts[1]
+    };
+    let (a, b, c) = (arith(4), arith(8), arith(16));
+    // Linear: twice the cases, twice the growth.
+    assert!(c - b <= 2 * (b - a) + 4, "arithmetic for 4, 8 and 16 cases: {a}, {b}, {c}");
+}
