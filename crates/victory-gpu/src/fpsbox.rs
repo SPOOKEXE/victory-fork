@@ -256,9 +256,19 @@ struct Panel {
     /// The text in `ring[at]`: the frame rate and the number of the look at
     /// the machine's load.
     shown: Option<(u32, u64)>,
+    /// The text in `ring[at]`, and when it was last looked at
+    /// (`crate::clock::now_ns`).
+    text: String,
+    looked: u64,
     ring: Vec<Made>,
     at: usize,
 }
+
+/// How long the box's text stands before it is made again: its numbers
+/// change nearly every frame (the rate to a tenth), and making it (the
+/// card's memory asked of the system, every dot of the text written) was up
+/// to 8 ms of the render thread's frame.
+const TEXT_NS: u64 = 250_000_000;
 
 static PANEL: Mutex<Option<Panel>> = Mutex::new(None);
 
@@ -295,13 +305,25 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
         *panel = Panel { made_for, ..Default::default() };
     }
     let key = (tenths, look.map_or(0, |(number, _)| number));
-    if panel.shown != Some(key) {
-        let text = if mode == Mode::All {
+    let now = crate::clock::now_ns();
+    let due = panel.shown.is_none() || now.saturating_sub(panel.looked) >= TEXT_NS;
+    let mut text = None;
+    if panel.shown != Some(key) && due {
+        panel.looked = now;
+        let made = if mode == Mode::All {
             let card = host.video_memory().map(|m| (m[0], m[1]));
             lines(tenths, look.map(|(_, s)| s), card).join("\n")
         } else {
-            fit(&text(tenths), RATE_COLUMNS)
+            fit(&self::text(tenths), RATE_COLUMNS)
         };
+        // The same text as shown: nothing to write.
+        if panel.shown.is_some() && made == panel.text {
+            panel.shown = Some(key);
+        } else {
+            text = Some(made);
+        }
+    }
+    if let Some(text) = text {
         let (w, h, lit) = bitmap(&text, scale);
         let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
         // The next buffer in turn, made at its first use.
@@ -330,6 +352,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
         }
         panel.at = at;
         panel.shown = Some(key);
+        panel.text = text;
     }
     let Some(m) = panel.ring.get(panel.at) else {
         return;

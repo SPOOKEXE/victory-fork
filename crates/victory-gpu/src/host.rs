@@ -11331,10 +11331,10 @@ impl Host {
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
         };
-        // A box a lit run (at scale 1: `k` rows of `k` times its columns),
-        // so the game shows through around them.
-        for &(row, from, cols) in &picture.runs {
-            let b = D3D12_BOX { left: from * k, top: row * k, front: 0, right: (from + cols) * k, bottom: (row + 1) * k, back: 1 };
+        // The picture's boxes (`crate::overlay::Picture::runs`), so the game
+        // shows through around them.
+        for &(row, from, cols, rows) in &picture.runs {
+            let b = D3D12_BOX { left: from * k, top: row * k, front: 0, right: (from + cols) * k, bottom: (row + rows) * k, back: 1 };
             // SAFETY: an open list, the back buffer in the copy destination
             // state and our buffer; the overlay fits inside the back buffer.
             unsafe { list.CopyTextureRegion(&dest, AT + from * k, AT + row * k, 0, &source, Some(&b)) };

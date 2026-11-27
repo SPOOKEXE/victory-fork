@@ -2027,9 +2027,28 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         // Before the block can be written ([`PUBLISHED`]; nothing to do
         // where no bit was ever set).
         PUBLISHED.clear(block);
+    }
+    // One call to the system a run of neighbouring blocks, not one a block
+    // (each held the guards' lock that the title's streaming threads wait
+    // for: 2,100 ms a frame of their waits while a scene loaded); a run the
+    // system refuses whole (it lies across two allocations) block by block.
+    let mut k = 0;
+    while k < blocks.len() {
+        let first = blocks[k];
+        let mut n = 1;
+        while k + n < blocks.len() && blocks[k + n] == first + n {
+            n += 1;
+        }
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { crate::native::Protect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        let whole = unsafe { crate::native::Protect((first * BLOCK) as *const _, n * BLOCK, PAGE_READWRITE, &mut old) } != 0;
+        if !whole {
+            for block in first..first + n {
+                // SAFETY: as above.
+                unsafe { crate::native::Protect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
+        k += n;
     }
     !blocks.is_empty()
 }

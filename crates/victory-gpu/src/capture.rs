@@ -235,7 +235,10 @@ fn save_at(path: &std::path::Path, width: u32, height: u32, pitch: usize, bgra: 
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = path.with_extension("png");
+    // (appended, not set: a snapshot's name has a decimal point of its own)
+    let mut path = path.as_os_str().to_owned();
+    path.push(".png");
+    let path = PathBuf::from(path);
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),

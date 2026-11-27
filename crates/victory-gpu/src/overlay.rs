@@ -1196,8 +1196,55 @@ pub(crate) fn scale(height: u32) -> u32 {
 /// picture has (the upload buffers that hold it are not written again).
 pub(crate) struct Picture {
     pub(crate) pixels: Vec<u32>,
-    pub(crate) runs: Vec<(u32, u32, u32)>,
+    /// The boxes copied onto the frame (at scale 1: first row, first
+    /// column, columns, rows): bands of lit rows, cut where no row of the
+    /// band has a lit pixel for [`BOX_GAP`] columns ([`boxes`]).
+    pub(crate) runs: Vec<(u32, u32, u32, u32)>,
     pub(crate) number: u64,
+}
+
+/// Columns with nothing lit in a band that cut it into two boxes.
+const BOX_GAP: u32 = 24;
+
+/// The boxes of the overlay's picture `base` (`WIDTH` by `HEIGHT`, a pixel
+/// lit where its alpha is not 0): consecutive rows with something lit are a
+/// band, cut into boxes at [`BOX_GAP`] unlit columns. What a box holds that
+/// is not lit is the picture's dark ground. A copy for each lit run was a
+/// command for each stroke of every letter, thousands a frame: 18 to 26 ms
+/// of the render thread's frame while the overlay was up.
+fn boxes(base: &[u32]) -> Vec<(u32, u32, u32, u32)> {
+    let lit_row = |y: u32| base[(y * WIDTH) as usize..((y + 1) * WIDTH) as usize].iter().any(|&p| p >> 24 != 0);
+    let mut out = Vec::new();
+    let mut y = 0;
+    while y < HEIGHT {
+        if !lit_row(y) {
+            y += 1;
+            continue;
+        }
+        let top = y;
+        while y < HEIGHT && lit_row(y) {
+            y += 1;
+        }
+        // The band's lit columns.
+        let lit: Vec<bool> =
+            (0..WIDTH).map(|x| (top..y).any(|r| base[(r * WIDTH + x) as usize] >> 24 != 0)).collect();
+        let mut x = 0;
+        while x < WIDTH {
+            if !lit[x as usize] {
+                x += 1;
+                continue;
+            }
+            let (from, mut last) = (x, x);
+            while x < WIDTH && (lit[x as usize] || x - last < BOX_GAP) {
+                if lit[x as usize] {
+                    last = x;
+                }
+                x += 1;
+            }
+            out.push((top, from, last + 1 - from, y - top));
+        }
+    }
+    out
 }
 
 /// How long a picture of the overlay is shown before it is drawn again.
@@ -1220,7 +1267,21 @@ pub(crate) fn pixels(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT
     {
         return Some(picture.clone());
     }
-    let (pixels, runs) = draw_pixels(format, k)?;
+    // Drawn again; the same pixels as the picture shown keep it (and its
+    // upload, `Host::overlay_onto`), so only a change is sent anew.
+    static BASE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let base = draw();
+    let mut seen = BASE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, f, scale, picture)) = last.as_mut()
+        && *f == format.0
+        && *scale == k
+        && *seen == base
+    {
+        *at = now;
+        return Some(picture.clone());
+    }
+    let (pixels, runs) = draw_pixels(&base, format, k)?;
+    *seen = base;
     let number = last.as_ref().map_or(1, |l| l.3.number + 1);
     let picture = std::sync::Arc::new(Picture { pixels, runs, number });
     *last = Some((now, format.0, k, picture.clone()));
@@ -1228,7 +1289,7 @@ pub(crate) fn pixels(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT
 }
 
 /// The overlay drawn now: pixels at scale `k` in `format`, and the lit runs.
-fn draw_pixels(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, k: u32) -> Option<(Vec<u32>, Vec<(u32, u32, u32)>)> {
+fn draw_pixels(base: &[u32], format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, k: u32) -> Option<(Vec<u32>, Vec<(u32, u32, u32, u32)>)> {
     use windows::Win32::Graphics::Dxgi::Common::*;
     let convert: fn(u32) -> u32 = match format {
         DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => |p| p,
@@ -1243,23 +1304,7 @@ fn draw_pixels(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, k: u
         },
         _ => return None,
     };
-    let base = draw();
-    let mut runs = Vec::new();
-    for y in 0..HEIGHT {
-        let row = &base[(y * WIDTH) as usize..((y + 1) * WIDTH) as usize];
-        let mut x = 0;
-        while x < WIDTH {
-            if row[x as usize] >> 24 == 0 {
-                x += 1;
-                continue;
-            }
-            let from = x;
-            while x < WIDTH && row[x as usize] >> 24 != 0 {
-                x += 1;
-            }
-            runs.push((y, from, x - from));
-        }
-    }
+    let runs = boxes(base);
     let w = WIDTH * k;
     let mut out = vec![0u32; (w * HEIGHT * k) as usize];
     for y in 0..HEIGHT * k {
@@ -1282,7 +1327,7 @@ mod tests {
         assert!(px.iter().any(|&p| p == 0xfff0_f0f0), "some text");
         assert!(px.iter().any(|&p| p == 0), "the game shows through");
         let picture = super::pixels(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, 2).unwrap();
-        assert!(!picture.runs.is_empty() && picture.runs.iter().all(|r| r.2 > 0));
+        assert!(!picture.runs.is_empty() && picture.runs.iter().all(|r| r.2 > 0 && r.3 > 0));
         let again = super::pixels(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, 2).unwrap();
         assert_eq!(again.number, picture.number, "within a quarter second: the same picture");
         for c in "0123456789FPSMS".chars() {
