@@ -29,6 +29,7 @@ shaders! {
     CARD_COMPARE "card_compare" "main";
     CARD_COMPARE_WIDE "card_compare_wide" "main";
     CARD_FETCH "card_fetch" "main";
+    MASKED_PATCH "masked_patch" "main";
     PLANE_CORNERS "plane_corners" "corner";
     PLANE_STEPS "plane_steps" "plane";
     PLANE_FLOATS "plane_floats" "plane";
