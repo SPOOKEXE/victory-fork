@@ -47,6 +47,10 @@ static DEPTH: AtomicU32 = AtomicU32::new(3);
 /// frame; F7: the longest frame).
 static MODE: AtomicU32 = AtomicU32::new(0);
 const MODE_NAMES: [&str; 3] = ["MEAN", "P90", "MAX"];
+/// What the card's view (F10) is sorted by, Q and E to step: 0 the time a
+/// frame, 1 the calls a frame, 2 the time a call.
+static SORT: AtomicU32 = AtomicU32::new(0);
+const SORT_NAMES: [&str; 3] = ["TOTAL", "CALLS", "EACH"];
 
 /// The mode's name, for the views' headings.
 fn mode_name() -> &'static str {
@@ -401,15 +405,20 @@ pub(crate) fn frame() {
             if pressed(4) {
                 DEPTH.store((depth + 1).min(DEPTHS.len() as u32 - 1), Relaxed);
             }
-            // Q, E: the mode of the processor's spans and the time line.
-            if matches!(VIEW.load(Relaxed), 0 | 3) {
-                let n = MODE_NAMES.len() as u32;
-                let mode = MODE.load(Relaxed);
+            // Q, E: the mode of the processor's spans and the time line; the
+            // card's view's order.
+            let stepped = match VIEW.load(Relaxed) {
+                0 | 3 => Some((&MODE, MODE_NAMES.len() as u32)),
+                1 => Some((&SORT, SORT_NAMES.len() as u32)),
+                _ => None,
+            };
+            if let Some((what, n)) = stepped {
+                let at = what.load(Relaxed);
                 if pressed(10) {
-                    MODE.store((mode + n - 1) % n, Relaxed);
+                    what.store((at + n - 1) % n, Relaxed);
                 }
                 if pressed(11) {
-                    MODE.store((mode + 1) % n, Relaxed);
+                    what.store((at + 1) % n, Relaxed);
                 }
             }
         }
@@ -1015,17 +1024,26 @@ pub(crate) fn draw() -> Vec<u32> {
         }
     } else if view == 1 {
         // The card's view: its time by pipeline, heaviest first.
-        text_at(&mut px, 2, 22, "CARD PER FRAME (F9: PROCESSOR)                      MS     X", HEAD);
+        let sort = SORT.load(Relaxed) as usize % SORT_NAMES.len();
+        let heading = format!("{:<44}{:>6}{:>6}{:>6}", format!("CARD BY {} (Q/E; F9: PROCESSOR)", SORT_NAMES[sort]), "TOTAL", "X", "EACH");
+        text_at(&mut px, 2, 22, &heading, HEAD);
         let all: f64 = s.gpu_rows.iter().map(|r| r.1).sum();
         lines.push((format!("ALL PIPELINES {all:.1} MS"), None));
-        for (name, ms, count) in &s.gpu_rows {
+        let mut rows: Vec<&(String, f64, f64)> = s.gpu_rows.iter().collect();
+        let each = |r: &(String, f64, f64)| if r.2 > 0.0 { r.1 / r.2 } else { 0.0 };
+        match sort {
+            1 => rows.sort_by(|a, b| b.2.total_cmp(&a.2)),
+            2 => rows.sort_by(|a, b| each(b).total_cmp(&each(a))),
+            _ => {}
+        }
+        for (name, ms, count) in rows {
             lines.push((pipeline_text(name), Some((*ms, *count, frame))));
         }
         if s.gpu_rows.is_empty() {
             lines.push(("(THE CARD'S TIMES ARRIVE A SECOND AND A HALF LATE)".to_owned(), None));
         }
     } else {
-        let heading = format!("SPAN PER FRAME, {:<4} (Q/E; F10: CARD)              MS     X", mode_name());
+        let heading = format!("{:<44}{:>6}{:>6}{:>6}", format!("SPANS, {} (Q/E; F10: CARD)", mode_name()), "TOTAL", "X", "EACH");
         text_at(&mut px, 2, 22, &heading, HEAD);
         // A heading when the thread group changes, then its spans.
         let (mut group, mut in_group) = ("", 0);
@@ -1048,7 +1066,9 @@ pub(crate) fn draw() -> Vec<u32> {
     }
     // (the card's view: wider names, the shaders' own)
     let names = if view == 1 || view == 3 || view == 4 { 228 } else { 150 };
-    let (bar_x, bar_w) = (names, WIDTH - names - 104);
+    // (the processor's and the card's views: a third number, the time a call)
+    let numbers_w = if view == 0 || view == 1 { 152 } else { 104 };
+    let (bar_x, bar_w) = (names, WIDTH - names - numbers_w);
     let mut y = top;
     for (label, value) in lines.iter().skip(first).take(room) {
         match value {
@@ -1076,7 +1096,11 @@ pub(crate) fn draw() -> Vec<u32> {
                     3 => format!("{v:6.1}{count:5.0}%"),
                     // (the system: per cent)
                     4 => format!("{v:11.0}%"),
-                    _ => format!("{v:6.1}{count:6.1}"),
+                    // (time a frame, calls a frame, time a call)
+                    _ => {
+                        let each = if *count > 0.0 { v / count } else { 0.0 };
+                        format!("{v:6.1}{count:6.1}{each:6.2}")
+                    }
                 };
                 text_at(&mut px, bar_x + bar_w + 4, y, &numbers, TEXT);
             }
