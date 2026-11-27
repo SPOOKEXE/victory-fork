@@ -322,6 +322,11 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// What the halves exchanged so far (`exchange_halves`), by value: the
+    /// pair, the console block and the host block it was exchanged in. The
+    /// same value again where the exchange serves (`shader::WaveScope`) is
+    /// the same pair, with no meeting of its own.
+    exchanged: HashMap<V, (V, V, usize, usize)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -2122,6 +2127,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            exchanged: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
                 .blocks
@@ -2794,6 +2800,15 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        // Two host waves to a console wave that exchange: wave operations
+        // and exchanges made where every lane runs stand for the same ones
+        // in blocks they dominate (`shader::WaveScope`).
+        if let Some((_, false, all)) = &self.exchange
+            && !self.local
+        {
+            let idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
+            self.s.wave_scope = Some(crate::emit::shader::WaveScope { idom, all: all.clone(), ir: usize::MAX, host: usize::MAX });
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -2827,6 +2842,9 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            if let Some(scope) = self.s.wave_scope.as_mut() {
+                (scope.ir, scope.host) = (b, self.cur);
+            }
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -4603,6 +4621,17 @@ impl<'a> Lower<'a> {
             let hi = self.s.m.select(at, upper, mine, z);
             return (lo, hi);
         }
+        // Exchanged already where it serves: both halves skip the meeting
+        // alike (they run the same code), and the dwords would be the same.
+        if let Some(&(lo, hi, made, host)) = self.exchanged.get(&mine) {
+            let serves = match &self.s.wave_scope {
+                Some(scope) => scope.serves(made, host, at),
+                None => host == at,
+            };
+            if serves {
+                return (lo, hi);
+            }
+        }
         // the pair of dwords of this thread's console wave: its half's, then both (with
         // `pair_meet`, of the set this meeting uses)
         let pair = self.exchange_pair(slot);
@@ -4629,6 +4658,11 @@ impl<'a> Lower<'a> {
         if set.is_none() {
             self.group_sync(at);
         }
+        let made = match &self.s.wave_scope {
+            Some(scope) if scope.host == at => scope.ir,
+            _ => usize::MAX,
+        };
+        self.exchanged.insert(mine, (lo, hi, made, at));
         (lo, hi)
     }
 

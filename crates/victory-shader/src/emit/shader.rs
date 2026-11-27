@@ -318,7 +318,66 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// Wave operations made so far ([`Shader::op`]), by opcode and
+    /// arguments: the value, the console block it was made in, and the host
+    /// block.
+    waves: std::collections::HashMap<(u32, Vec<V>), (V, usize, usize)>,
+    /// Where a wave operation made earlier may stand for one asked now: set
+    /// by the lowering ([`WaveScope`]).
+    pub wave_scope: Option<WaveScope>,
 }
+
+/// What [`Shader::op`] needs to give a wave operation made earlier for the
+/// same one asked again ([`WAVE_OPS`]): the console blocks' immediate
+/// dominators, which of them every lane of the console wave runs (two host
+/// waves to a console wave, and each block either run by every host lane or
+/// by none), the console block being lowered and its host block.
+///
+/// In a block every lane runs, every host lane is active, so a wave
+/// operation on the same values is the same as one made in a block that
+/// dominates it and every lane runs too. Each exchange of one between the
+/// halves is a meeting (`Lower::exchange_halves`): the batch culls' append
+/// idiom asked the same wave sum and the same ballot again after the
+/// one-lane branch of its atomic, two meetings in five.
+pub struct WaveScope {
+    pub idom: Vec<usize>,
+    pub all: Vec<bool>,
+    pub ir: usize,
+    pub host: usize,
+}
+
+impl WaveScope {
+    /// Whether console block `a` dominates `b`.
+    pub fn dominates(&self, a: usize, mut b: usize) -> bool {
+        loop {
+            if a == b {
+                return true;
+            }
+            match self.idom.get(b) {
+                Some(&up) if up != b && up != usize::MAX => b = up,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether a value made in console block `made` (host block `host`)
+    /// stands for one asked now in host block `asked`.
+    pub fn serves(&self, made: usize, host: usize, asked: usize) -> bool {
+        if host == asked {
+            return true;
+        }
+        asked == self.host
+            && self.all.get(made).copied().unwrap_or(false)
+            && self.all.get(self.ir).copied().unwrap_or(false)
+            && self.dominates(made, self.ir)
+    }
+}
+
+/// DXIL opcodes of the wave operations [`Shader::op`] makes once where it
+/// can ([`WaveScope`]): lane index, lane count, any/all true, all equal,
+/// ballot, read lane at, read first lane, active op, active bit op, prefix
+/// op, quad read, bit counts.
+const WAVE_OPS: [u32; 14] = [111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 135, 136];
 
 impl Shader {
     pub fn new(pixel: bool) -> Self {
@@ -376,6 +435,8 @@ impl Shader {
             lds: None,
             main,
             entry,
+            waves: std::collections::HashMap::new(),
+            wave_scope: None,
         }
     }
 
@@ -401,6 +462,17 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        let key = WAVE_OPS.contains(&opcode).then(|| (opcode, args.to_vec()));
+        if let Some(&(v, made, host)) = key.as_ref().and_then(|k| self.waves.get(k)) {
+            // (no scope: only the same host block)
+            let serves = match &self.wave_scope {
+                Some(scope) => scope.serves(made, host, block),
+                None => host == block,
+            };
+            if serves {
+                return v;
+            }
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -410,7 +482,16 @@ impl Shader {
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
-        self.m.call(block, f, all)
+        let v = self.m.call(block, f, all);
+        if let Some(k) = key {
+            // (made in the console block being lowered only if asked in its host block)
+            let made = match &self.wave_scope {
+                Some(scope) if scope.host == block => scope.ir,
+                _ => usize::MAX,
+            };
+            self.waves.insert(k, (v, made, block));
+        }
+        v
     }
 
     /// The handle of the user-data constant buffer, made in the entry block.
