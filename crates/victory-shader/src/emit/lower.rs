@@ -3534,6 +3534,8 @@ impl<'a> Lower<'a> {
             139,
             &[directory, at, iu, both, align],
         );
+        // The host fills the directory before the shader runs.
+        self.s.m.fixed(entry);
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
         // A page without a copy: its number, at a place by the number, or
@@ -3553,7 +3555,7 @@ impl<'a> Lower<'a> {
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
-        self.s.op(
+        let fault = self.s.op(
             c,
             "rawBufferStore.i32",
             Attr::NoUnwind,
@@ -3561,6 +3563,7 @@ impl<'a> Lower<'a> {
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
+        self.s.m.sink(fault);
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));

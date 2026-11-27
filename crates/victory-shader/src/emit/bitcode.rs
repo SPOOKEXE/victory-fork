@@ -260,6 +260,13 @@ pub(crate) struct Module {
     /// Blocks cut in two by [`Module::split`]: the block that now holds the rest of each
     /// (code added later, the terminator, the edges out).
     rest: HashMap<usize, usize>,
+    /// Reads of memory nothing writes while the shader runs (the memory
+    /// directory): reused across stores as values without an effect are
+    /// ([`Module::fixed`]).
+    fixed: std::collections::HashSet<u32>,
+    /// Stores to memory the shader never reads (the memory faults): one
+    /// that repeats an earlier one is left out ([`Module::sink`]).
+    sinks: std::collections::HashSet<u32>,
 }
 
 impl Module {
@@ -417,6 +424,26 @@ impl Module {
             && census::enabled()
         {
             self.tags.insert(i, tag);
+        }
+    }
+
+    /// Notes that the read `v` is of memory no store changes while the
+    /// shader runs, so [`opt`] may give an earlier read's result for it
+    /// whatever stands between them.
+    pub fn fixed(&mut self, v: V) {
+        if let V::Inst(i) = v {
+            self.fixed.insert(i);
+        }
+    }
+
+    /// Notes that the store `v` writes memory no shader reads, which the
+    /// host reads after the dispatch: [`opt`] leaves out a store of the
+    /// same value to the same place as one every path to it has made (a
+    /// store of another thread in between could as well have come before
+    /// both).
+    pub fn sink(&mut self, v: V) {
+        if let V::Inst(i) = v {
+            self.sinks.insert(i);
         }
     }
 
