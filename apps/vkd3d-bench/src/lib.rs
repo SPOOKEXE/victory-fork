@@ -155,6 +155,151 @@ fn world_texture(own: &Own, rng: &mut Rng, sides: u64) -> Option<(ID3D12Resource
     own.texture(side, mips, format)
 }
 
+/// [`world_texture`] placed in `pool` instead (the same draws of `rng`).
+fn world_placed(own: &Own, pool: &std::sync::Arc<Pool>, rng: &mut Rng, sides: u64) -> Option<(ID3D12Resource, u64, Placed)> {
+    let side = 64u64 << rng.below(sides + 1);
+    let format = FORMATS[rng.below(FORMATS.len() as u64) as usize];
+    let mips = if rng.below(4) == 0 { 1 } else { side.trailing_zeros() as u16 + 1 };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: side,
+        Height: side as u32,
+        DepthOrArraySize: 1,
+        MipLevels: mips,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    Pool::place(pool, &own.device, &desc)
+}
+
+/// Textures placed in card heaps of our own (`CreatePlacedResource`), as
+/// the layer could keep its copies instead of vkd3d-proton's chunks: heaps
+/// of [`POOL_HEAP`] bytes, each with its free runs at 64 KiB, a texture in
+/// the smallest run it fits of any heap (best fit), runs joined again when
+/// a texture goes, a new heap when none fits. The streaming workload runs
+/// with it (`--placed`) to set its waste and spread against vkd3d-proton's.
+pub struct Pool {
+    inner: std::sync::Mutex<PoolInner>,
+}
+
+/// A pool heap's bytes.
+pub const POOL_HEAP: u64 = 64 << 20;
+
+struct PoolInner {
+    /// Each heap and its free runs (offset, length), in order.
+    heaps: Vec<(ID3D12Heap, Vec<(u64, u64)>)>,
+    /// Nanoseconds and calls of finding a run.
+    ns: u64,
+    calls: u64,
+}
+
+/// A texture's run in a pool heap, given back when this is dropped.
+pub struct Placed {
+    pool: std::sync::Arc<Pool>,
+    heap: usize,
+    offset: u64,
+    len: u64,
+}
+
+impl Drop for Placed {
+    fn drop(&mut self) {
+        let mut inner = self.pool.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let runs = &mut inner.heaps[self.heap].1;
+        let at = runs.partition_point(|r| r.0 < self.offset);
+        runs.insert(at, (self.offset, self.len));
+        // Joined with the runs either side when they touch.
+        if at + 1 < runs.len() && runs[at].0 + runs[at].1 == runs[at + 1].0 {
+            runs[at].1 += runs[at + 1].1;
+            runs.remove(at + 1);
+        }
+        if at > 0 && runs[at - 1].0 + runs[at - 1].1 == runs[at].0 {
+            runs[at - 1].1 += runs[at].1;
+            runs.remove(at);
+        }
+    }
+}
+
+impl Pool {
+    pub fn new() -> std::sync::Arc<Pool> {
+        std::sync::Arc::new(Pool { inner: std::sync::Mutex::new(PoolInner { heaps: Vec::new(), ns: 0, calls: 0 }) })
+    }
+
+    /// `desc` placed in the smallest free run it fits, and the bytes it takes.
+    fn place(pool: &std::sync::Arc<Pool>, device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, u64, Placed)> {
+        // SAFETY: a plain query on a description.
+        let info = unsafe { device.GetResourceAllocationInfo(0, &[*desc]) };
+        let len = info.SizeInBytes.next_multiple_of(64 << 10);
+        if len > POOL_HEAP {
+            return None;
+        }
+        let began = std::time::Instant::now();
+        let mut inner = pool.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let best = inner
+            .heaps
+            .iter()
+            .enumerate()
+            .flat_map(|(h, (_, runs))| runs.iter().enumerate().map(move |(r, run)| (h, r, run.1)))
+            .filter(|&(_, _, l)| l >= len)
+            .min_by_key(|&(_, _, l)| l);
+        let (heap, run) = match best {
+            Some((h, r, _)) => (h, r),
+            None => {
+                let desc = D3D12_HEAP_DESC {
+                    SizeInBytes: POOL_HEAP,
+                    Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    Alignment: 64 << 10,
+                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+                };
+                let mut made: Option<ID3D12Heap> = None;
+                // SAFETY: a plain description and an out pointer of ours.
+                unsafe { device.CreateHeap(&desc, &mut made) }.ok()?;
+                inner.heaps.push((made?, vec![(0, POOL_HEAP)]));
+                (inner.heaps.len() - 1, 0)
+            }
+        };
+        let offset = inner.heaps[heap].1[run].0;
+        let runs = &mut inner.heaps[heap].1;
+        if runs[run].1 == len {
+            runs.remove(run);
+        } else {
+            runs[run].0 += len;
+            runs[run].1 -= len;
+        }
+        inner.ns += began.elapsed().as_nanos() as u64;
+        inner.calls += 1;
+        let heap_object = inner.heaps[heap].0.clone();
+        drop(inner);
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: a heap of ours, a free run that holds the resource, an out pointer of ours.
+        let placed = unsafe { device.CreatePlacedResource(&heap_object, offset, desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made) };
+        let slot = Placed { pool: pool.clone(), heap, offset, len };
+        placed.ok()?;
+        Some((made?, info.SizeInBytes, slot))
+    }
+
+    /// Heaps, their bytes, free bytes, free runs, the largest, and the mean
+    /// microseconds of finding a run.
+    fn state(&self) -> (u64, u64, u64, u64, u64, f64) {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let runs = inner.heaps.iter().flat_map(|h| h.1.iter());
+        let free: u64 = runs.clone().map(|r| r.1).sum();
+        let largest = runs.clone().map(|r| r.1).max().unwrap_or(0);
+        let n = inner.heaps.len() as u64;
+        (n, n * POOL_HEAP, free, runs.count() as u64, largest, inner.ns as f64 / inner.calls.max(1) as f64 / 1e3)
+    }
+
+    fn line(&self) -> String {
+        let (n, bytes, free, runs, largest, us) = self.state();
+        format!(
+            "our heaps {n} ({} MiB), {:.0}% free in {runs} runs, largest {} KiB; {us:.1} us a placement",
+            bytes >> 20,
+            free as f64 / bytes.max(1) as f64 * 100.0,
+            largest >> 10
+        )
+    }
+}
+
 /// What a workload found: lines of its profile, and whether its checks held.
 pub struct Report {
     pub lines: Vec<String>,
@@ -322,16 +467,29 @@ pub enum Pick {
 /// a chunk (their group). Checks the counts stay whole each round and that
 /// the chunks never hold more than the world's bytes and a quarter, and
 /// two chunks (the new load goes into the room let go).
-pub fn streaming(own: &Own, rng: &mut Rng, textures: usize, rounds: u32, pick: Pick) -> Report {
+///
+/// With `pool` the textures are placed in heaps of our own ([`Pool`])
+/// instead: the same draws, its line in place of the chunks', and its bytes
+/// held to the same bound.
+pub fn streaming(own: &Own, rng: &mut Rng, textures: usize, rounds: u32, pick: Pick, pool: Option<std::sync::Arc<Pool>>) -> Report {
     const CHUNK: u64 = 16 << 20;
     let began = std::time::Instant::now();
     let start = own.read();
     let (mut lines, mut failed) = (Vec::new(), Vec::new());
-    // (texture, bytes, its group)
-    let mut world: Vec<(ID3D12Resource, u64, u32)> = Vec::with_capacity(textures);
+    let make = |rng: &mut Rng, sides: u64| match &pool {
+        Some(pool) => world_placed(own, pool, rng, sides).map(|(t, b, p)| (t, b, Some(p))),
+        None => world_texture(own, rng, sides).map(|(t, b)| (t, b, None)),
+    };
+    // Each kind's line, and the bytes its textures take on the card.
+    let state = |now: &[u64]| match &pool {
+        Some(pool) => (pool.line(), pool.state().1),
+        None => (chunk_line(now, &start), walk(now, 1, 1) - walk(&start, 1, 1)),
+    };
+    // (texture, bytes, its group, its run in a pool heap)
+    let mut world: Vec<(ID3D12Resource, u64, u32, Option<Placed>)> = Vec::with_capacity(textures);
     let (mut group, mut in_group) = (0u32, 0u64);
     while world.len() < textures {
-        let Some((t, bytes)) = world_texture(own, rng, 4) else { continue };
+        let Some((t, bytes, placed)) = make(rng, 4) else { continue };
         if bytes >= 2 << 20 {
             continue;
         }
@@ -339,12 +497,14 @@ pub fn streaming(own: &Own, rng: &mut Rng, textures: usize, rounds: u32, pick: P
             (group, in_group) = (group + 1, 0);
         }
         in_group += bytes;
-        world.push((t, bytes, group));
+        world.push((t, bytes, group, placed));
     }
-    let live_bytes = |w: &[(ID3D12Resource, u64, u32)]| w.iter().map(|t| t.1).sum::<u64>();
+    let live_bytes = |w: &[(ID3D12Resource, u64, u32, Option<Placed>)]| w.iter().map(|t| t.1).sum::<u64>();
     let loaded = own.read();
-    lines.push(format!("load: {} textures, {} MiB in {} groups; {}; {}", world.len(), live_bytes(&world) >> 20, group + 1, chunk_line(&loaded, &start), sub_line(&loaded, &start)));
-    check_whole(&loaded, &start, world.len() as u64, "load", &mut failed);
+    lines.push(format!("load: {} textures, {} MiB in {} groups; {}; {}", world.len(), live_bytes(&world) >> 20, group + 1, state(&loaded).0, sub_line(&loaded, &start)));
+    if pool.is_none() {
+        check_whole(&loaded, &start, world.len() as u64, "load", &mut failed);
+    }
     let mut before = loaded;
     for round in 0..rounds {
         let few = match pick {
@@ -373,12 +533,14 @@ pub fn streaming(own: &Own, rng: &mut Rng, textures: usize, rounds: u32, pick: P
         let let_go = own.read();
         let mut made = 0u64;
         while made < gone {
-            let Some((t, bytes)) = world_texture(own, rng, 3) else { continue };
+            let Some((t, bytes, placed)) = make(rng, 3) else { continue };
             made += bytes;
-            world.push((t, bytes, 1_000_000 + round));
+            world.push((t, bytes, 1_000_000 + round, placed));
         }
         let now = own.read();
-        check_whole(&now, &start, world.len() as u64, &format!("round {round}"), &mut failed);
+        if pool.is_none() {
+            check_whole(&now, &start, world.len() as u64, &format!("round {round}"), &mut failed);
+        }
         lines.push(format!(
             "round {round} ({}, {} groups, 1 in {share}): {} MiB let go, {} chunks back; {} MiB loaded, {} chunks made; {} for {} MiB; {}",
             if few { "few" } else { "scattered" },
@@ -387,11 +549,11 @@ pub fn streaming(own: &Own, rng: &mut Rng, textures: usize, rounds: u32, pick: P
             let_go[at::CHUNKS_FREED] - before[at::CHUNKS_FREED],
             made >> 20,
             now[at::CHUNKS_MADE] - let_go[at::CHUNKS_MADE],
-            chunk_line(&now, &start),
+            state(&now).0,
             live_bytes(&world) >> 20,
             sub_line(&now, &let_go),
         ));
-        let chunk_bytes = walk(&now, 1, 1) - walk(&start, 1, 1);
+        let chunk_bytes = state(&now).1;
         let world_bytes = live_bytes(&world);
         if chunk_bytes > world_bytes + world_bytes / 4 + 2 * CHUNK {
             failed.push(format!("round {round}: {} MiB of chunks for {} MiB of textures", chunk_bytes >> 20, world_bytes >> 20));
@@ -399,6 +561,8 @@ pub fn streaming(own: &Own, rng: &mut Rng, textures: usize, rounds: u32, pick: P
         before = now;
     }
     drop(world);
+    // (The pool's heaps go with it, before the end's checks.)
+    drop(pool);
     finish(own, lines, failed, start, began)
 }
 
@@ -447,6 +611,16 @@ mod tests {
     fn a_streaming_world_reuses_the_room_it_lets_go() {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Some(own) = own() else { return };
-        held(&streaming(&own, &mut Rng::new(0x2545_f491_4f6c_dd1d), 3000, 12, Pick::Mixed));
+        held(&streaming(&own, &mut Rng::new(0x2545_f491_4f6c_dd1d), 3000, 12, Pick::Mixed, None));
+    }
+
+    /// The same world placed in heaps of our own: the counts stay whole
+    /// (nothing of it is in vkd3d-proton's chunks) and the heaps hold to
+    /// the same bound.
+    #[test]
+    fn a_streaming_world_in_our_heaps_reuses_the_room_it_lets_go() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(own) = own() else { return };
+        held(&streaming(&own, &mut Rng::new(0x2545_f491_4f6c_dd1d), 3000, 12, Pick::Mixed, Some(Pool::new())));
     }
 }

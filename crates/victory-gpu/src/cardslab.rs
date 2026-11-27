@@ -16,8 +16,11 @@
 //! bytes of slots are free. Off unless `VICTORY_CARD_SLABS=1`: run of
 //! 2026-11-27 lost 37 % to slots rounded up to a power of two (4.3 GB of
 //! copies in 5.9 GB of slots), and 4.4 GB of free slots of other sizes sat
-//! unused while 11,833 textures waited for a copy. The packing wants a
-//! finer allocator, compared against vkd3d-proton's first (`apps/vkd3d-bench`).
+//! unused while 11,833 textures waited for a copy. A best fit at 64 KiB
+//! does no better (`vkd3d-bench streaming --placed`, 20,000 textures, 30
+//! rounds): 7,552 MiB of heaps against vkd3d-proton's 6,016 MiB of chunks,
+//! which place by the driver's own alignments, finer than a placed
+//! resource's 64 KiB. Kept for measuring, not for use.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;

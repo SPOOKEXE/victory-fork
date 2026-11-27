@@ -57,6 +57,10 @@ fn main() -> std::process::ExitCode {
             rounds: u32,
             #[arg(long, value_enum, default_value = "mixed")]
             pick: PickArg,
+            /// Place the textures in card heaps of our own (best fit at
+            /// 64 KiB) instead of vkd3d-proton's chunks.
+            #[arg(long)]
+            placed: bool,
         },
         /// Every workload with its defaults.
         All,
@@ -75,22 +79,23 @@ fn main() -> std::process::ExitCode {
         }
     };
     let mut rng = Rng::new(cli.seed);
-    let streaming = |own: &Own, rng: &mut Rng, textures, rounds, pick: PickArg| {
+    let streaming = |own: &Own, rng: &mut Rng, textures, rounds, pick: PickArg, placed: bool| {
         let pick = match pick {
             PickArg::Few => Pick::Few,
             PickArg::Scattered => Pick::Scattered,
             PickArg::Mixed => Pick::Mixed,
         };
-        vkd3d_bench::streaming(own, rng, textures, rounds, pick)
+        vkd3d_bench::streaming(own, rng, textures, rounds, pick, placed.then(vkd3d_bench::Pool::new))
     };
     let runs: Vec<(&str, vkd3d_bench::Report)> = match cli.what {
         What::Holes { count, side } => vec![("holes", vkd3d_bench::holes(&own, count, side))],
         What::Random { steps, every } => vec![("random", vkd3d_bench::random(&own, &mut rng, steps, every))],
-        What::Streaming { textures, rounds, pick } => vec![("streaming", streaming(&own, &mut rng, textures, rounds, pick))],
+        What::Streaming { textures, rounds, pick, placed } => vec![("streaming", streaming(&own, &mut rng, textures, rounds, pick, placed))],
         What::All => vec![
             ("holes", vkd3d_bench::holes(&own, 96, 512)),
             ("random", vkd3d_bench::random(&own, &mut rng, 3000, 500)),
-            ("streaming", streaming(&own, &mut rng, 3000, 12, PickArg::Mixed)),
+            ("streaming", streaming(&own, &mut rng, 3000, 12, PickArg::Mixed, false)),
+            ("streaming, our heaps", streaming(&own, &mut Rng::new(cli.seed), 3000, 12, PickArg::Mixed, true)),
         ],
     };
     let mut ok = true;
