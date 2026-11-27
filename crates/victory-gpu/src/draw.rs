@@ -1677,7 +1677,10 @@ impl State {
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
+        {
+            let _span = crate::trace::span("bind: textures picked by index");
+            self.early_textures(list, p, compute);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1739,7 +1742,10 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged);
+            let made = {
+                let _span = crate::trace::span("bind: tables");
+                self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged)
+            };
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1787,6 +1793,7 @@ impl State {
                     }
                 }
             }
+            let _views_span = crate::trace::span("bind: root views");
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -4541,6 +4548,7 @@ impl State {
         }
         let (bounded, at) = match (hit, gathered) {
             _ if direct => {
+                let _span = crate::trace::span("indirect: the arguments' copy");
                 args.refresh(list, arguments, len);
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
