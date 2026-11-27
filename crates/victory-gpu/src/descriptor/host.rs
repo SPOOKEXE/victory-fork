@@ -2233,9 +2233,13 @@ impl HostHeap {
             // A running submission may still read the old resource through
             // this slot. (Outside the lock: letting go takes another lock,
             // or frees a host resource.) The same object written again is
-            // held by the slot's new reference: the old one goes now.
+            // held by the slot's new reference: the old one goes now. So
+            // does a dynamic slot's: it is taken again only after the list
+            // that read it has run (`draw::State::tables_done`), and each
+            // retirement is a push under the lock every recording thread
+            // shares (76,000 dynamic slots a frame).
             if let Some(old) = old {
-                if lean {
+                if lean || index >= self.dyn_start {
                     drop(old);
                 } else {
                     crate::host::retire(old);
