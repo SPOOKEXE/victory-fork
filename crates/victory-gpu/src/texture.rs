@@ -69,72 +69,143 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
-    /// The size of the buffer if it came from the pool of spare staging
-    /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
-    /// own, released when this is dropped.
-    pooled: u64,
+    /// The slot of a slab this staging lives in, given back when this is
+    /// dropped ([`staging_buffer`]); `None`: a buffer of its own, released
+    /// with it.
+    slot: Option<Slot>,
 }
 
-/// A staging buffer nothing holds: the buffer and where it is mapped.
-struct Spare(ID3D12Resource, usize);
+/// A staging buffer's place in a slab: its slot size, the slab, and the
+/// offset in it.
+#[derive(Clone, Copy)]
+struct Slot {
+    size: u64,
+    slab: u32,
+    offset: u64,
+}
 
-// SAFETY: a D3D12 buffer and its mapping, touched by nobody while it is
-// spare.
-unsafe impl Send for Spare {}
+/// An upload buffer of [`SLAB`] bytes cut into slots of one size, where it
+/// is mapped, and how many of its slots are taken.
+struct Slab {
+    buffer: ID3D12Resource,
+    data: usize,
+    size: u64,
+    taken: u32,
+}
 
-/// Spare staging buffers by size (a power of two), and their bytes in all.
-static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
-    Mutex::new((std::collections::BTreeMap::new(), 0));
-/// The most bytes kept spare, and the largest buffer that is pooled.
-const SPARE_MOST: (u64, u64) = (64 << 20, 8 << 20);
-/// Staging buffers taken from the spare ones, and made, since the start.
+// SAFETY: a D3D12 buffer and its mapping; the slots are handed out under
+// the lock, and each to one staging at a time.
+unsafe impl Send for Slab {}
+
+/// The slabs by number, the free slots by size (slab, offset), the bytes
+/// of free slots, and the next slab's number.
+struct Slabs {
+    slabs: std::collections::HashMap<u32, Slab>,
+    free: std::collections::BTreeMap<u64, Vec<(u32, u64)>>,
+    spare: u64,
+    next: u32,
+}
+
+static SLABS: Mutex<Option<Slabs>> = Mutex::new(None);
+/// A slab's bytes, and the largest staging buffer that takes a slot.
+const SLAB: u64 = 64 << 20;
+const SLOT_MOST: u64 = 8 << 20;
+/// Staging buffers given a slot that was free, and buffers made (slabs, and
+/// stagings of their own), since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// A mapped upload buffer of `total` bytes for a texture's staging, all
-/// zeros, and its pool size (0: not pooled).
+/// A mapped upload buffer for a texture's staging of `total` bytes, all
+/// zeros: the buffer, where its staging starts in its mapping, and the slot
+/// (`None`: a buffer of its own).
 ///
-/// Every texture the title streams in got a buffer of its own from the
-/// host and gave it back when its staging went: about a quarter of a
-/// millisecond to make (run 213's profile: 25 ms a frame on the recording
-/// threads for some 100 uploads, most of it the graphics kernel waiting)
-/// and more to free on the thread that submits. A streaming burst is 200
-/// to 500 uploads in a frame (run 222), and those are the frames that
-/// dip. Buffers of up to 8 MiB are now kept by size and used again,
-/// zeroed as a new one is (levels not there yet must read as zeros).
-/// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
-/// `VICTORY_STAGING_POOL=alt`: twenty seconds with the pool, twenty
-/// without, in turn, each change said in the log: a buffer made without
-/// is freed as before, and the spare ones wait for the next turn.
-/// `VICTORY_STAGING_POOL_MB`: the most kept spare (256 unless said).
-fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+/// Every texture the title streams in needs one, and a buffer of its own
+/// from the host is a device memory allocation of vkd3d-proton's: run of
+/// 2026-11-27 made 32,642 in the first minute (19.6 GB), each zeroed by
+/// vkd3d-proton (7.6 GB of memset on the CPU) and freed again with its
+/// texture's staging, at 0.5 to 1 ms a call to allocate and to free; the
+/// earlier pool kept 64 MiB of spares and gave back 5,824 of 33,139. A
+/// staging buffer of up to 8 MiB is now a slot of a 64 MiB slab cut into
+/// slots of its size (a power of two, at least 64 KiB): one allocation a
+/// slab, the slot zeroed here, given back when its staging goes (lists
+/// hold the staging until their submission has run). Slabs with every slot
+/// free go back to the host while more than [`spare_most`] bytes of slots
+/// are free. `VICTORY_STAGING_POOL=0`: a buffer of its own each time.
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, Option<Slot>)> {
+    use std::sync::atomic::Ordering::Relaxed;
     let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !staging_pool() {
-        // (Counted as made: the frame log's "staging N made" is then the
-        // buffers of a run without the pool too.)
-        SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
+    if size > SLOT_MOST || !staging_pool() {
+        SPARE_STATS[1].fetch_add(1, Relaxed);
+        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, None));
     }
-    let spare = {
-        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = all.0.get_mut(&size).and_then(Vec::pop);
-        if taken.is_some() {
-            all.1 -= size;
-        }
-        taken
-    };
-    if let Some(Spare(buffer, data)) = spare {
-        SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // SAFETY: the buffer's own mapping, `size` bytes, which nothing
-        // else holds.
-        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
-        return Some((buffer, data as *mut u8, size));
+    let mut guard = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+    let all = guard.get_or_insert_with(|| Slabs {
+        slabs: std::collections::HashMap::new(),
+        free: std::collections::BTreeMap::new(),
+        spare: 0,
+        next: 0,
+    });
+    if all.free.get(&size).is_none_or(Vec::is_empty) {
+        // A new slab of slots of this size. (Made under the lock: a slab
+        // is one allocation for 8 to 1024 stagings.)
+        let (buffer, data) = host.upload_buffer(SLAB)?;
+        SPARE_STATS[1].fetch_add(1, Relaxed);
+        let number = all.next;
+        all.next = all.next.wrapping_add(1);
+        all.slabs.insert(number, Slab { buffer, data: data as usize, size, taken: 0 });
+        let free = all.free.entry(size).or_default();
+        // (Highest offset first: slots are taken from the end, lowest first.)
+        free.extend((0..SLAB / size).rev().map(|i| (number, i * size)));
+        all.spare += SLAB;
+    } else {
+        SPARE_STATS[0].fetch_add(1, Relaxed);
     }
-    SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+    let (number, offset) = all.free.get_mut(&size)?.pop()?;
+    all.spare -= size;
+    let slab = all.slabs.get_mut(&number)?;
+    slab.taken += 1;
+    let (buffer, data) = (slab.buffer.clone(), slab.data as *mut u8);
+    drop(guard);
+    if zero_slots() {
+        // SAFETY: the slot's part of the slab's mapping, which only this
+        // staging holds from now.
+        unsafe { std::ptr::write_bytes(data.add(offset as usize), 0, total as usize) };
+    }
+    Some((buffer, data, Some(Slot { size, slab: number, offset })))
 }
 
-/// Whether staging buffers are taken from and returned to the spare ones
-/// now (`VICTORY_STAGING_POOL`).
+/// Whether a slot is zeroed when it is taken (`VICTORY_STAGING_ZERO=0`: not).
+/// Every detiling writes each level, the title's or zeros, so a slot's old
+/// contents should never reach a texture; the zeroing stays until runs
+/// without it show the same pictures.
+fn zero_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_ZERO").is_none_or(|v| v != "0"))
+}
+
+/// Gives `slot` back to its slab; a slab with every slot free goes back to
+/// the host while more than [`spare_most`] bytes of slots are free.
+fn give_back(slot: Slot) {
+    let mut guard = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(all) = guard.as_mut() else { return };
+    let Some(slab) = all.slabs.get_mut(&slot.slab) else { return };
+    slab.taken -= 1;
+    all.spare += slot.size;
+    all.free.entry(slot.size).or_default().push((slot.slab, slot.offset));
+    if slab.taken == 0 && all.spare > spare_most() {
+        let size = slab.size;
+        if let Some(free) = all.free.get_mut(&size) {
+            free.retain(|&(n, _)| n != slot.slab);
+        }
+        all.spare -= SLAB;
+        // (The buffer is let go outside the lock.)
+        let gone = all.slabs.remove(&slot.slab);
+        drop(guard);
+        drop(gone);
+    }
+}
+
+/// Whether staging buffers are slots of slabs now (`VICTORY_STAGING_POOL`;
+/// `alt`: twenty seconds with, twenty without, in turn).
 fn staging_pool() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -151,7 +222,7 @@ fn staging_pool() -> bool {
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
-                    "texture staging buffers are taken from the spare ones from now (VICTORY_STAGING_POOL=alt): {}",
+                    "texture staging buffers are slots of slabs from now (VICTORY_STAGING_POOL=alt): {}",
                     if on { "ON" } else { "off, made and freed each time" }
                 );
             }
@@ -160,11 +231,14 @@ fn staging_pool() -> bool {
     }
 }
 
-/// The most bytes of staging buffers kept spare (`VICTORY_STAGING_POOL_MB`).
+/// The most bytes of free slots kept in slabs nothing else uses
+/// (`VICTORY_STAGING_POOL_MB`, 2048 unless said: with 256, run of
+/// 2026-11-27 made and freed 539 slabs in two minutes, 3 ms a slab and up
+/// to 46 ms; the slabs are the PC's memory).
 fn spare_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST.0, |mb| mb << 20)
+        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(2048 << 20, |mb| mb << 20)
     })
 }
 
@@ -524,13 +598,9 @@ impl Drop for Staging {
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
         // Nothing holds the staging any more (lists keep it until they are
-        // reset, after their submission has run): its buffer is spare.
-        if self.pooled != 0 {
-            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= spare_most() {
-                all.1 += self.pooled;
-                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
-            }
+        // reset, after their submission has run): its slot is free.
+        if let Some(slot) = self.slot {
+            give_back(slot);
         }
     }
 }
@@ -1553,13 +1623,20 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
-    crate::host::name_frame(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (buffer, data, slot) = staging_buffer(host, total)?;
+    if let Some(slot) = slot {
+        // The staging's subresources are at the slot's offset in the slab.
+        for footprint in &mut footprints {
+            footprint.Offset += slot.offset;
+        }
+    } else {
+        crate::host::name_frame(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -1582,7 +1659,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
-        pooled,
+        slot,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

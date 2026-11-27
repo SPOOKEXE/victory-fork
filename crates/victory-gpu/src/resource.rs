@@ -1142,6 +1142,9 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// Placed in a heap of ours (`crate::cardslab`): its slot, retired when
+    /// this goes.
+    slot: Option<crate::cardslab::Taken>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1396,7 +1399,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true).ok() } else { None };
+            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true).ok().map(|t| t.0) } else { None };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1409,11 +1412,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Ok(texture),
+            Some(texture) => Ok((texture, None)),
             None => host_texture(&r.desc, r.host.state, clear),
         };
-        let texture = match texture {
-            Ok(texture) => texture,
+        let (texture, slot) = match texture {
+            Ok(made) => made,
             Err(NoTexture::Refused) => {
                 r.host.refused.store(true, Relaxed);
                 return None;
@@ -1449,6 +1452,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
+        host.slot = slot;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1485,7 +1489,8 @@ pub(crate) fn host_made<'a>(
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process, less [`holes`], is under 96 % of the budget the system
+/// by this process, less [`holes`] and the free slots of our own heaps
+/// (`crate::cardslab`), is under 96 % of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
@@ -1523,7 +1528,9 @@ pub(crate) fn room() -> bool {
         // a context buffer at 17.8 GB of 18.1 with a second program
         // holding 3.5 GB, and ran short at 22.2 of 22.2 with none).
         Some([budget, used, ..]) => {
-            used.saturating_sub(holes::bytes()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(holes::bytes() + crate::cardslab::BYTES[1].load(Relaxed))
+                + crate::shadow::card_room_kept()
+                + targets_room_kept()
                 < budget / 100 * room_percent()
                 && used < budget / 100 * 97
         }
@@ -1544,8 +1551,9 @@ pub(crate) fn room() -> bool {
 /// throughout, while 20,809 title textures waited for a copy.
 ///
 /// So: the card's memory in use that the host's own counts do not place
-/// (host textures, twins included; card copies of title buffers and
-/// windows; the tile pool's heaps) is sampled twice a second while the
+/// (host textures, twins included, those placed in heaps of ours by the
+/// heaps' bytes; card copies of title buffers and windows; the tile pool's
+/// heaps) is sampled twice a second while the
 /// card is four fifths full or more; its least (of the larger of two
 /// samples in a row, so one count read while an allocation is half made
 /// does not set it) is what is in use besides, and whatever more is
@@ -1568,7 +1576,12 @@ pub(crate) mod holes {
 
     /// The bytes the host's own counts place on the card.
     pub(crate) fn placed() -> u64 {
-        super::HOST_TEXTURES[1].load(Relaxed) + crate::shadow::card_bytes() + crate::tiles::pool_bytes()
+        // (Copies placed in heaps of ours are counted by the heaps' bytes.)
+        let slabs = &crate::cardslab::BYTES;
+        super::HOST_TEXTURES[1].load(Relaxed).saturating_sub(slabs[3].load(Relaxed))
+            + slabs[0].load(Relaxed)
+            + crate::shadow::card_bytes()
+            + crate::tiles::pool_bytes()
     }
 
     /// Takes a sample from `memory` (`Host::video_memory`), at most twice
@@ -2242,6 +2255,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            slot: None,
         }
     }
 
@@ -2259,6 +2273,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            slot: None,
         }
     }
 }
@@ -2272,6 +2287,9 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        if let Some(slot) = self.slot.take() {
+            crate::host::retire(slot);
         }
     }
 }
@@ -2360,7 +2378,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<crate::cardslab::Taken>), NoTexture> {
     host_texture_as(desc, state, clear, false)
 }
 
@@ -2372,7 +2390,7 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<crate::cardslab::Taken>), NoTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2426,6 +2444,20 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // A texture the title fills: in a slot of a heap of ours if it fits.
+    if !reserved && fills(desc) && clear_value.is_none() && crate::cardslab::on() {
+        // SAFETY: the description has the host layout (checked size, same fields).
+        let host_desc = unsafe { (&raw const d).cast::<D3D12_RESOURCE_DESC>().read() };
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+        if let Some((texture, slot)) = crate::cardslab::place(&host.device, &host_desc, state) {
+            crate::host::name(&texture, || {
+                format!("texture {}x{} f{} flags {:#x} (placed)", d.width, d.height, d.format, d.flags)
+            });
+            // SAFETY: a plain query on a live resource.
+            let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes;
+            return Ok((texture, Some(crate::cardslab::Taken(slot, bytes))));
+        }
+    }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
@@ -2475,7 +2507,7 @@ fn host_texture_as(
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
     });
-    Ok(texture)
+    Ok((texture, None))
 }
 
 /// The host copy of title texture `this` if it is made and was made
