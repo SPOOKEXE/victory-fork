@@ -68,7 +68,7 @@ enum Const {
 }
 
 /// LLVM binary opcodes (the same codes serve the float forms).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Bin {
     Add = 0,
     Sub = 1,
@@ -85,7 +85,7 @@ pub(crate) enum Bin {
 }
 
 /// `atomicrmw` operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
@@ -99,7 +99,7 @@ pub(crate) enum Rmw {
     UMin = 10,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Cast {
     Trunc = 0,
     ZExt = 1,
@@ -175,7 +175,7 @@ pub(crate) mod pred {
     pub const SLE: u8 = 41;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Op {
     Bin(Bin, V, V),
     Cast(Cast, V),
@@ -260,6 +260,51 @@ pub(crate) struct Module {
     /// Blocks cut in two by [`Module::split`]: the block that now holds the rest of each
     /// (code added later, the terminator, the edges out).
     rest: HashMap<usize, usize>,
+    /// Pure instructions made so far (binary operations, casts, compares,
+    /// selects, extracts, element addresses), by type and operation: the
+    /// last few made, each with the console block and the block it was
+    /// asked in ([`Module::reuses`]). The same computation asked again where
+    /// one of them serves is that value, so equal values are one `V` (what
+    /// the lowering's caches of wave operations and exchanges key on).
+    pure: HashMap<(Ty, Op), Vec<(V, usize, usize)>>,
+    /// Where a value made in another block may stand for one asked now: set
+    /// by the lowering ([`WaveScope`]).
+    pub scope: Option<WaveScope>,
+}
+
+/// What [`Module::reuses`] needs to give a value made earlier, in another
+/// block, for the same one asked again: the console blocks' immediate
+/// dominators, which of them every lane of the console wave runs (two host
+/// waves to a console wave, and each block either run by every host lane or
+/// by none), the console block being lowered and its host block.
+///
+/// In a block every lane runs, every host lane is active, so a wave
+/// operation on the same values is the same as one made in a block that
+/// dominates it and every lane runs too; a pure instruction needs only the
+/// dominance. Each exchange of a value between the halves is a meeting
+/// (`Lower::exchange_many`): the batch culls' append idiom asked the same
+/// wave sum and the same ballot again after the one-lane branch of its
+/// atomic, two meetings in five.
+pub struct WaveScope {
+    pub idom: Vec<usize>,
+    pub all: Vec<bool>,
+    pub ir: usize,
+    pub host: usize,
+}
+
+impl WaveScope {
+    /// Whether console block `a` dominates `b`.
+    pub fn dominates(&self, a: usize, mut b: usize) -> bool {
+        loop {
+            if a == b {
+                return true;
+            }
+            match self.idom.get(b) {
+                Some(&up) if up != b && up != usize::MAX => b = up,
+                _ => return false,
+            }
+        }
+    }
 }
 
 impl Module {
@@ -483,20 +528,84 @@ impl Module {
         rest
     }
 
+    /// Whether a value made in block `host` (console block `made`, or
+    /// `usize::MAX`) stands for one asked now in block `asked`: the same
+    /// block (or what [`Module::split`] moved its end to), or with
+    /// [`WaveScope`] a dominating console block every lane runs, asked in the
+    /// host block of the console block being lowered, which every lane runs
+    /// too.
+    pub fn reuses(&self, made: usize, host: usize, asked: usize) -> bool {
+        if host == asked || self.end_of(host) == self.end_of(asked) {
+            return true;
+        }
+        self.scope.as_ref().is_some_and(|s| {
+            asked == s.host
+                && s.all.get(made).copied().unwrap_or(false)
+                && s.all.get(s.ir).copied().unwrap_or(false)
+                && s.dominates(made, s.ir)
+        })
+    }
+
+    /// The console block a value made now in `block` belongs to for
+    /// [`Module::reuses`]: the one being lowered if `block` is its host
+    /// block, else none (`usize::MAX`).
+    pub fn made_in(&self, block: usize) -> usize {
+        match &self.scope {
+            Some(s) if s.host == block => s.ir,
+            _ => usize::MAX,
+        }
+    }
+
+    /// A pure instruction: the same one made earlier where it serves
+    /// ([`Module::reuses`]), else a new one.
+    fn pure(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        /// How many of the same computation are kept to be asked again.
+        const KEPT: usize = 8;
+        let key = (ty, op);
+        if let Some(made) = self.pure.get(&key)
+            && let Some(&(v, ..)) = made.iter().rev().find(|&&(_, made, host)| self.reuses(made, host, block))
+        {
+            return v;
+        }
+        let v = self.push(block, ty, key.1.clone());
+        let made = self.made_in(block);
+        let list = self.pure.entry(key).or_default();
+        if list.len() == KEPT {
+            list.remove(0);
+        }
+        list.push((v, made, block));
+        v
+    }
+
     pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
         let ty = self.type_of(a);
-        self.push(block, ty, Op::Bin(op, a, b))
+        self.pure(block, ty, Op::Bin(op, a, b))
     }
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
-        self.push(block, to, Op::Cast(op, v))
+        self.pure(block, to, Op::Cast(op, v))
     }
     pub fn cmp(&mut self, block: usize, pred: u8, a: V, b: V) -> V {
         let t = self.int(1);
-        self.push(block, t, Op::Cmp(pred, a, b))
+        self.pure(block, t, Op::Cmp(pred, a, b))
     }
-    pub fn select(&mut self, block: usize, c: V, t: V, f: V) -> V {
+    /// `c ? t : f`, where a select on the same `c` inside `t` or `f` gives
+    /// the side `c` picks of it (a guard's select of a register's old value
+    /// under a wave operation's select of its identity: the same sum).
+    pub fn select(&mut self, block: usize, c: V, mut t: V, mut f: V) -> V {
+        if let V::Inst(i) = t
+            && let Op::Select(c2, a, _) = self.insts[i as usize].op
+            && c2 == c
+        {
+            t = a;
+        }
+        if let V::Inst(i) = f
+            && let Op::Select(c2, _, b) = self.insts[i as usize].op
+            && c2 == c
+        {
+            f = b;
+        }
         let ty = self.type_of(t);
-        self.push(block, ty, Op::Select(c, t, f))
+        self.pure(block, ty, Op::Select(c, t, f))
     }
     pub fn extract(&mut self, block: usize, agg: V, index: u32) -> V {
         let ty = match &self.types[self.type_of(agg).0 as usize] {
@@ -504,7 +613,7 @@ impl Module {
             TypeDef::Array(_, t) => *t,
             t => panic!("extractvalue from {t:?}"),
         };
-        self.push(block, ty, Op::Extract(agg, index))
+        self.pure(block, ty, Op::Extract(agg, index))
     }
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
@@ -535,7 +644,7 @@ impl Module {
         };
         let ty = self.ptr_in(elem, space);
         let zero = self.i32(0);
-        self.push(block, ty, Op::Gep(arr, ptr, vec![zero, index]))
+        self.pure(block, ty, Op::Gep(arr, ptr, vec![zero, index]))
     }
     pub fn load(&mut self, block: usize, ptr: V) -> V {
         let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
@@ -1133,6 +1242,59 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same pure instruction asked again is one value where the first serves: in its
+    /// block (or the rest of it after a split), and with a scope in the host block of a console
+    /// block every lane runs that a console block every lane runs dominates; a load never.
+    #[test]
+    fn pure_instructions_asked_again_where_they_serve_are_one_value() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let arr = m.array(4, i32t);
+        let lds = m.global("lds", arr, 3);
+        let (a, b, c) = (m.new_block(), m.new_block(), m.new_block());
+        let k = m.i32(3);
+        let p = m.element(a, lds, k);
+        let x = m.load(a, p);
+        let y = m.bin(a, Bin::Add, x, k);
+        assert_eq!(m.bin(a, Bin::Add, x, k), y);
+        assert_ne!(m.load(a, p), x, "a load is not pure");
+        assert_ne!(m.bin(b, Bin::Add, x, k), y, "another block without a scope");
+        let into = m.new_block();
+        let rest = m.split(a, into);
+        assert_eq!(m.bin(rest, Bin::Add, x, k), y, "the rest of a split block");
+        // console blocks 0 -> 1 -> 2, every lane in 0 and 2; host blocks a, b, c
+        m.scope = Some(WaveScope { idom: vec![0, 0, 1], all: vec![true, false, true], ir: 0, host: a });
+        let z = m.bin(a, Bin::Mul, x, k);
+        if let Some(s) = m.scope.as_mut() {
+            (s.ir, s.host) = (2, c);
+        }
+        assert_eq!(m.bin(c, Bin::Mul, x, k), z, "a dominating block every lane runs");
+        assert_ne!(m.bin(b, Bin::Mul, x, k), z, "not the host block being lowered");
+        let d = m.new_block();
+        if let Some(s) = m.scope.as_mut() {
+            (s.ir, s.host) = (1, d);
+        }
+        assert_ne!(m.bin(d, Bin::Mul, x, k), z, "a block not every lane runs");
+    }
+
+    /// A select on a condition inside a select on the same one takes the side it picks.
+    #[test]
+    fn a_select_inside_a_select_on_its_condition_is_the_side_it_picks() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let arr = m.array(4, i32t);
+        let lds = m.global("lds", arr, 3);
+        let a = m.new_block();
+        let k = m.i32(1);
+        let p = m.element(a, lds, k);
+        let (x, y) = (m.load(a, p), m.load(a, p));
+        let z = m.i32(0);
+        let on = m.cmp(a, pred::NE, x, z);
+        let guarded = m.select(a, on, x, y);
+        assert_eq!(m.select(a, on, guarded, z), m.select(a, on, x, z));
+        assert_eq!(m.select(a, on, z, guarded), m.select(a, on, z, y));
+    }
 
     #[test]
     fn vbr_and_blocks() {
