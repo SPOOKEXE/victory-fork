@@ -105,6 +105,16 @@ fn lowered_on(
     wide: &HashSet<usize>,
     host_wave: u32,
 ) -> Result<HostShader, ShaderError> {
+    lowered_counting(native, p, wide, host_wave).map(|(shader, _)| shader)
+}
+
+/// [`lowered_on`], with the number of meetings the halves have for exchanges.
+fn lowered_counting(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+    host_wave: u32,
+) -> Result<(HostShader, u32), ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
@@ -122,7 +132,8 @@ fn lowered_on(
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
-    Ok(HostShader {
+    let meetings = lowered.meetings;
+    Ok((HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -133,7 +144,7 @@ fn lowered_on(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
-    })
+    }, meetings))
 }
 
 #[test]
@@ -1191,4 +1202,127 @@ fn a_backward_permute_reads_within_the_lanes_half() {
         }
     }
     eprintln!("ran on the hardware device (threads, host wave): {ran:?}");
+}
+
+/// An inclusive wave prefix sum of v7 into v1 as a whole-wave section: within each row of 16
+/// lanes by `row_shr`, then each row adds the totals of the rows before it (read from lanes
+/// 15, 31 and 47) under lane-constant EXECs. `total` also reads lane 63 into s19 (the sum).
+fn prefix_section(total: bool) -> Vec<u32> {
+    let mut w = vec![
+        0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+        0xD501_0001,
+        0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+    ];
+    for shr in [1u32, 2, 4, 8] {
+        // v_add_nc_u32 v1, v1, v1 row_shr:shr bound_ctrl:1
+        w.extend_from_slice(&[0x4A02_02FA, 0xFF08_0001 | (0x110 + shr) << 8]);
+    }
+    w.extend_from_slice(&[
+        0xD760_0010,
+        0x0001_1F01, // v_readlane_b32 s16, v1, 15
+        0xD760_0011,
+        0x0001_3F01, // v_readlane_b32 s17, v1, 31
+        0xD760_0012,
+        0x0001_5F01, // v_readlane_b32 s18, v1, 47
+        0xBEFE_03FF,
+        0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xBEFF_03FF,
+        0xFFFF_FFFF, // s_mov_b32 exec_hi, -1
+        0x4A02_0210, // v_add_nc_u32 v1, s16, v1
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0x4A02_0211, // v_add_nc_u32 v1, s17, v1
+        0xBEFF_03FF,
+        0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
+        0x4A02_0212, // v_add_nc_u32 v1, s18, v1
+    ]);
+    if total {
+        w.extend_from_slice(&[0xD760_0013, 0x0001_7F01]); // v_readlane_b32 s19, v1, 63
+    }
+    w.push(0xBEFE_0404); // s_mov_b64 exec, s[4:5]
+    w
+}
+
+/// The per-wave append idiom's sums: the threads below s0 take part (a guard, no branch),
+/// each with t + s1. A wave sum, a branch only lane 0 takes, then the inclusive prefix of the
+/// same values: the prefix's lower-half total is the sum the halves exchanged before the
+/// branch, so one meeting serves both (with the ballot of the lanes, which goes along). Each
+/// lane stores (prefix, sum) at `uav[2 t..]`.
+#[test]
+fn a_wave_sum_and_a_later_prefix_of_the_same_values_share_one_meeting() {
+    let mut words = vec![
+        0x340A_0083, // v_lshlrev_b32 v5, 3, v0 (8 bytes a lane)
+        0x4A0E_0001, // v_add_nc_u32 v7, s1, v0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    ];
+    words.extend(prefix_section(true));
+    words.extend_from_slice(&[
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0xBF88_0001, // s_cbranch_execz over the next
+        0x7E0C_0285, // v_mov_b32 v6, 5
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+    ]);
+    words.extend(prefix_section(false));
+    words.extend_from_slice(&[
+        0x7E04_0213, // v_mov_b32 v2, s19
+        0x38 << 26 | 0x1D << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 5, // buffer_store_dwordx2 v[1:2], v5, s[8:11], 0 offen
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let (shader, meetings) = lowered_counting(&native, &p, &HashSet::new(), 32).expect("lower");
+    assert_eq!(meetings, 1, "the sum, its ballot and the prefix's lower total in one meeting");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, add) in [(64u32, 3u32), (40, 7), (20, 1), (1, 9)] {
+        let Some(out) = whole_uav(&shader, [below, add], 128) else { return };
+        let sum: u32 = (0..below).map(|t| t + add).sum();
+        for t in 0..64 {
+            let want = if t < below { [(0..=t).map(|u| u + add).sum(), sum] } else { [0, 0] };
+            assert_eq!(out[2 * t as usize..2 * t as usize + 2], want, "lane {t}, {below} lanes");
+        }
+    }
+    eprintln!("ran on the hardware device: every lane's prefix and the sum");
+}
+
+/// The threads at or past s0 take part (a guard, no branch). `v_mbcnt` of EXEC (a lane mask
+/// read as data: the halves exchange its ballot), then `v_readfirstlane` of t + s1: which
+/// half has the console's first lane is that same ballot, so the read needs only its value
+/// exchanged. With s0 >= 32 the first lane is in the upper half. Each lane stores
+/// (lanes below it, first lane's value) at `uav[2 t..]`.
+#[test]
+fn a_first_lane_read_after_a_ballot_of_its_guard_exchanges_only_its_value() {
+    let words = [
+        0x340A_0083, // v_lshlrev_b32 v5, 3, v0 (8 bytes a lane)
+        0x4A0E_0001, // v_add_nc_u32 v7, s1, v0
+        0x7D86_0000, // v_cmp_le_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xD765_0002,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v2, exec_lo, 0
+        0xD766_0002,
+        0x0002_047F, // v_mbcnt_hi_u32_b32 v2, exec_hi, v2
+        0x7E28_0507, // v_readfirstlane_b32 s20, v7
+        0x7E06_0214, // v_mov_b32 v3, s20
+        0x38 << 26 | 0x1D << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 5, // buffer_store_dwordx2 v[2:3], v5, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let (shader, meetings) = lowered_counting(&native, &p, &HashSet::new(), 32).expect("lower");
+    assert_eq!(meetings, 2, "the ballot of EXEC, then the first lane's value");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (from, add) in [(0u32, 3u32), (20, 7), (40, 1), (63, 9)] {
+        let Some(out) = whole_uav(&shader, [from, add], 128) else { return };
+        for t in 0..64 {
+            let want = if t >= from { [t - from, from + add] } else { [0, 0] };
+            assert_eq!(out[2 * t as usize..2 * t as usize + 2], want, "lane {t}, lanes from {from}");
+        }
+    }
+    eprintln!("ran on the hardware device: every lane's count and the first lane's value");
 }

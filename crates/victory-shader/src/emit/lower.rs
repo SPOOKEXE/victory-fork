@@ -86,6 +86,9 @@ pub(crate) struct Lowered {
     /// Quad-local reads written through quad operations (`quad_read`).
     #[cfg(test)]
     pub quad_reads: u32,
+    /// Meetings of the halves for exchanges (`exchange_many`).
+    #[cfg(test)]
+    pub meetings: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -285,8 +288,8 @@ struct Lower<'a> {
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
-    /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
-    /// IR block whether every lane runs it (exchanges need both halves there).
+    /// exchange dword ([`Self::exchange_pair`]), whether the group has no upper half (32 threads
+    /// or fewer), and per IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
@@ -326,11 +329,11 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
-    /// What the halves exchanged so far (`exchange_halves`), by value: the
+    /// What the halves exchanged so far (`exchange_many`), by value: each
     /// pair, the console block and the host block it was exchanged in. The
-    /// same value again where the exchange serves (`shader::WaveScope`) is
-    /// the same pair, with no meeting of its own.
-    exchanged: HashMap<V, (V, V, usize, usize)>,
+    /// same value again where an exchange serves (`bitcode::Module::reuses`)
+    /// is the same pair, with no meeting of its own.
+    exchanged: HashMap<V, Vec<(V, V, usize, usize)>>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -939,6 +942,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     }
     pass(&mut kind, &mut firsts, true)
 }
+
+/// Most values the halves of a console wave exchange in one meeting ([`Lower::exchange_many`]).
+const EXCHANGE_DWORDS: u32 = 2;
 
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
@@ -1895,10 +1901,11 @@ impl<'a> Lower<'a> {
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
-                                // numbers go through two exchange dwords past the program's LDS
+                                // numbers go through exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                // (two sets of them, `exchange_set`)
-                                s.lds_dwords += 4 * group.div_ceil(64);
+                                // (two sets of them, `exchange_set`, each of up to
+                                // `EXCHANGE_DWORDS` values per half)
+                                s.lds_dwords += 4 * EXCHANGE_DWORDS * group.div_ceil(64);
                             }
                         }
                     }
@@ -2531,7 +2538,8 @@ impl<'a> Lower<'a> {
                     let total = self.s.op(c, &format!("waveActiveOp.{sfx}"), Attr::NoUnwind, ty, 119, &[arg, k0, ku]);
                     let tb = bits(self, total);
                     let c = self.cur;
-                    let (lo, _) = self.exchange_halves(c, tb);
+                    let ballot = self.ballot_low(c, on);
+                    let (lo, _) = self.exchange_many(c, &[tb, ballot])[0];
                     let lo = back(self, lo);
                     let cl = self.console_lane();
                     let k32 = self.s.m.i32(32);
@@ -2543,7 +2551,10 @@ impl<'a> Lower<'a> {
                 None => {
                     let rb = bits(self, r);
                     let c = self.cur;
-                    let (lo, hi) = self.exchange_halves(c, rb);
+                    // (with the ballot of the lanes summed: the per-wave append idiom reads
+                    // EXEC as data next, `mask_dword`, which then needs no meeting of its own)
+                    let ballot = self.ballot_low(c, on);
+                    let (lo, hi) = self.exchange_many(c, &[rb, ballot])[0];
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
@@ -2625,8 +2636,8 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
-            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let xs = self.exchange_many(self.cur, &[r_lo, r_hi]);
+            let ((lo0, lo1), (hi0, hi1)) = (xs[0], xs[1]);
             let c = self.cur;
             let d0 = self
                 .s
@@ -2807,12 +2818,12 @@ impl<'a> Lower<'a> {
         }
         // Two host waves to a console wave that exchange: wave operations
         // and exchanges made where every lane runs stand for the same ones
-        // in blocks they dominate (`shader::WaveScope`).
+        // in blocks they dominate (`bitcode::WaveScope`).
         if let Some((_, false, all)) = &self.exchange
             && !self.local
         {
             let idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
-            self.s.wave_scope = Some(crate::emit::shader::WaveScope { idom, all: all.clone(), ir: usize::MAX, host: usize::MAX });
+            self.s.m.scope = Some(crate::emit::bitcode::WaveScope { idom, all: all.clone(), ir: usize::MAX, host: usize::MAX });
         }
         self.cur = self.s.entry;
         self.find_sections();
@@ -2847,7 +2858,7 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
-            if let Some(scope) = self.s.wave_scope.as_mut() {
+            if let Some(scope) = self.s.m.scope.as_mut() {
                 (scope.ir, scope.host) = (b, self.cur);
             }
             let preds: Vec<usize> = p.blocks[b]
@@ -2931,6 +2942,8 @@ impl<'a> Lower<'a> {
             guarded_wide_loads: self.s.guarded_wide_loads,
             #[cfg(test)]
             quad_reads: self.s.quad_reads,
+            #[cfg(test)]
+            meetings: self.s.meetings,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -4700,85 +4713,116 @@ impl<'a> Lower<'a> {
         self.s.op(rest, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
     }
 
-    /// With `pair_meet`: which of the two sets of exchange slots the next meeting uses (0 or
-    /// 2), by the parity of this half's meeting count. Exchanges alternate between them, so
-    /// one meeting is enough: a half writes a set again only after its next meeting, which
-    /// the other half reaches only once it has read that set.
+    /// With `pair_meet`: which of the two sets of exchange slots the next meeting uses (the
+    /// offset 0 or `2 * EXCHANGE_DWORDS`), by the parity of this half's meeting count.
+    /// Exchanges alternate between them, so one meeting is enough: a half writes a set again
+    /// only after its next meeting, which the other half reaches only once it has read that set.
     fn exchange_set(&mut self, at: usize) -> Option<V> {
         let (mine, _, _) = self.meet_slots()?;
         let count = self.s.m.load(at, mine);
-        let (one, k2) = (self.s.m.i32(1), self.s.m.i32(2));
+        let (one, size) = (self.s.m.i32(1), self.s.m.i32(2 * EXCHANGE_DWORDS));
         let parity = self.s.m.bin(at, Bin::And, count, one);
-        Some(self.s.m.bin(at, Bin::Mul, parity, k2))
+        Some(self.s.m.bin(at, Bin::Mul, parity, size))
+    }
+
+    /// The low dword of the ballot of `bit` in block `at`: a host wave of 32's whole ballot,
+    /// the dword [`Self::mask_dword`] exchanges for a lane mask read as data.
+    fn ballot_low(&mut self, at: usize, bit: V) -> V {
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self.s.op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        self.s.m.extract(at, r, 0)
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
+        self.exchange_many(at, &[mine])[0]
+    }
+
+    /// [`Self::exchange_halves`] of up to [`EXCHANGE_DWORDS`] values in one meeting: a value
+    /// exchanged already where that serves needs none, and with all of them so the meeting
+    /// is left out. Both halves run the same code, so both leave out the same meetings.
+    fn exchange_many(&mut self, at: usize, mine: &[V]) -> Vec<(V, V)> {
+        assert!(mine.len() as u32 <= EXCHANGE_DWORDS);
         let Some((slot, small, _)) = self.exchange.as_ref().map(|(a, b, _)| (*a, *b, ())) else {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return mine.iter().map(|&v| (v, z)).collect();
         };
         if small {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return mine.iter().map(|&v| (v, z)).collect();
         }
         if self.local {
             // each host wave on its own: its half holds `mine`, the other nothing
             let cl = self.console_lane();
             let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
             let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
-            let lo = self.s.m.select(at, upper, z, mine);
-            let hi = self.s.m.select(at, upper, mine, z);
-            return (lo, hi);
+            return mine
+                .iter()
+                .map(|&v| (self.s.m.select(at, upper, z, v), self.s.m.select(at, upper, v, z)))
+                .collect();
         }
-        // Exchanged already where it serves: both halves skip the meeting
-        // alike (they run the same code), and the dwords would be the same.
-        if let Some(&(lo, hi, made, host)) = self.exchanged.get(&mine) {
-            let serves = match &self.s.wave_scope {
-                Some(scope) => scope.serves(made, host, at),
-                None => host == at,
-            };
-            if serves {
-                return (lo, hi);
+        // Exchanged already where it serves: the dwords would be the same.
+        let known = |l: &Self, v: V| {
+            let all = l.exchanged.get(&v)?;
+            all.iter().rev().find(|&&(_, _, made, host)| l.s.m.reuses(made, host, at)).map(|&(lo, hi, ..)| (lo, hi))
+        };
+        let mut new: Vec<V> = Vec::new();
+        for &v in mine {
+            if known(self, v).is_none() && !new.contains(&v) {
+                new.push(v);
             }
         }
-        // the pair of dwords of this thread's console wave: its half's, then both (with
-        // `pair_meet`, of the set this meeting uses)
-        let pair = self.exchange_pair(slot);
-        let set = self.exchange_set(at);
-        let pair = match set {
-            Some(set) => self.s.m.bin(at, Bin::Add, pair, set),
-            None => pair,
-        };
-        let cl = self.console_lane();
-        let five = self.s.m.i32(5);
-        let half = self.s.m.bin(at, Bin::LShr, cl, five);
-        let index = self.s.m.bin(at, Bin::Add, pair, half);
-        let lds = self.s.lds();
-        let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
-        self.group_sync(at);
-        let one = self.s.m.i32(1);
-        let k1 = self.s.m.bin(at, Bin::Add, pair, one);
-        let p0 = self.s.m.element(at, lds, pair);
-        let p1 = self.s.m.element(at, lds, k1);
-        let lo = self.s.m.load(at, p0);
-        let hi = self.s.m.load(at, p1);
-        // the slots are written again only after every thread read them
-        if set.is_none() {
+        if !new.is_empty() {
+            // this thread's console wave's dwords (with `pair_meet`, of the set this meeting
+            // uses): value k at 2k for the lower half, 2k + 1 for the upper
+            let pair = self.exchange_pair(slot);
+            let set = self.exchange_set(at);
+            let pair = match set {
+                Some(set) => self.s.m.bin(at, Bin::Add, pair, set),
+                None => pair,
+            };
+            let cl = self.console_lane();
+            let five = self.s.m.i32(5);
+            let half = self.s.m.bin(at, Bin::LShr, cl, five);
+            let lds = self.s.lds();
+            let at_k = |l: &mut Self, k: usize, h: V| {
+                let k = l.s.m.i32(2 * k as u32);
+                let base = l.s.m.bin(at, Bin::Add, pair, k);
+                let index = l.s.m.bin(at, Bin::Add, base, h);
+                l.s.m.element(at, lds, index)
+            };
+            for (k, &v) in new.iter().enumerate() {
+                let ptr = at_k(self, k, half);
+                self.s.m.store(at, ptr, v);
+            }
             self.group_sync(at);
+            #[cfg(test)]
+            {
+                self.s.meetings += 1;
+            }
+            let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+            let made = self.s.m.made_in(at);
+            for (k, &v) in new.iter().enumerate() {
+                let p0 = at_k(self, k, zero);
+                let p1 = at_k(self, k, one);
+                let lo = self.s.m.load(at, p0);
+                let hi = self.s.m.load(at, p1);
+                self.exchanged.entry(v).or_default().push((lo, hi, made, at));
+            }
+            // the slots are written again only after every thread read them
+            if set.is_none() {
+                self.group_sync(at);
+            }
         }
-        let made = match &self.s.wave_scope {
-            Some(scope) if scope.host == at => scope.ir,
-            _ => usize::MAX,
-        };
-        self.exchanged.insert(mine, (lo, hi, made, at));
-        (lo, hi)
+        mine.iter().map(|&v| known(self, v).expect("exchanged")).collect()
     }
 
-    /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// The first exchange dword of this thread's console wave (made in the entry block): a
+    /// group of several console waves has `4 * EXCHANGE_DWORDS` for each (two sets, each with
+    /// a dword per half and value, [`Self::exchange_many`]).
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -4787,10 +4831,10 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let two = self.s.m.i32(2);
-        let twice = self.s.m.bin(e, Bin::Shl, wave, two);
+        let per = self.s.m.i32(4 * EXCHANGE_DWORDS);
+        let first = self.s.m.bin(e, Bin::Mul, wave, per);
         let base = self.s.m.i32(slot);
-        let v = self.s.m.bin(e, Bin::Add, base, twice);
+        let v = self.s.m.bin(e, Bin::Add, base, first);
         self.pair = Some(v);
         v
     }
@@ -9152,10 +9196,16 @@ impl<'a> Lower<'a> {
                         let (lo, _) = self.exchange_halves(c, mine);
                         lo
                     } else {
-                        let i32t = self.s.t.i32;
-                        let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        // Whether each half has a lane where the guard holds: with a guard,
+                        // its ballot's low dword (a host wave of 32 has no high one), the
+                        // dword a lane mask read as data exchanges too (`mask_dword`), so a
+                        // ballot of the same mask exchanged before serves.
+                        let has = match guard {
+                            Some(g) => self.ballot_low(c, g),
+                            None => self.s.m.cast(c, Cast::ZExt, any, self.s.t.i32),
+                        };
+                        let xs = self.exchange_many(c, &[has, mine]);
+                        let ((lo_has, hi_has), (lo, hi)) = (xs[0], xs[1]);
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
