@@ -16,6 +16,20 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
+/// A picture asked for by a snapshot (F1, `crate::overlay`): the next
+/// presented frame is saved at this path (without its extension), whether
+/// or not frames are being captured.
+static PICTURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Asks for the next presented frame as `<path>.png`.
+pub(crate) fn picture_next(path: PathBuf) {
+    *PICTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
+
+fn picture_due() -> bool {
+    PICTURE.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
@@ -180,17 +194,21 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    picture_due() || folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    if let Some(path) = PICTURE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        save_at(&path, width, height, pitch, bgra, rows);
+    }
+    if let Some(folder) = folder() {
+        save_at(&folder.join(format!("frame-{n}")), width, height, pitch, bgra, rows);
+    }
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
+/// Saves 8-bit RGBA or BGRA rows as `<path>.png`, at half size.
+fn save_at(path: &std::path::Path, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -217,7 +235,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
+    let path = path.with_extension("png");
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
@@ -496,7 +514,9 @@ fn dump_one(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            if let Some(folder) = folder() {
+                save_at(&folder.join(name), f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            }
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }

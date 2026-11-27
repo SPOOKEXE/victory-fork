@@ -41,6 +41,17 @@ static SCROLL: AtomicU32 = AtomicU32::new(0);
 /// a view's rows are made again it may have none for a moment.)
 static ROWS_SEEN: AtomicU32 = AtomicU32::new(0);
 static DEPTH: AtomicU32 = AtomicU32::new(3);
+/// What the processor's spans (F9) and the time line (F7) show, Q and E to
+/// step: 0 the mean frame (F9: the mean per frame; F7: the frame nearest the
+/// mean length), 1 the 90th percentile, 2 the most (F9: the most in one
+/// frame; F7: the longest frame).
+static MODE: AtomicU32 = AtomicU32::new(0);
+const MODE_NAMES: [&str; 3] = ["MEAN", "P90", "MAX"];
+
+/// The mode's name, for the views' headings.
+fn mode_name() -> &'static str {
+    MODE_NAMES[MODE.load(Relaxed) as usize % MODE_NAMES.len()]
+}
 
 struct State {
     /// Frame lengths (ms), oldest first.
@@ -67,8 +78,8 @@ struct State {
     summed: u32,
     since_ns: u64,
     vram: (u64, u64),
-    /// F9, Up, Down, Left, Right, F10, F8, F7, F1, F3 as last seen.
-    keys: [bool; 10],
+    /// F9, Up, Down, Left, Right, F10, F8, F7, F1, F3, Q, E as last seen.
+    keys: [bool; 12],
     /// The time line (F7), kept only while it is up: spans of the last
     /// [`KEEP_NS`] (start ns, length ns, thread group, name), the presents'
     /// times, and the frame laid out at the last half second.
@@ -77,6 +88,12 @@ struct State {
     laid: Option<Laid>,
     /// A snapshot being recorded (F1, `VICTORY_SNAPSHOT_AT`).
     snap: Option<Snap>,
+    /// With F9 in the p90 or max mode: the half second's spans (their key's
+    /// place in `win_keys`, start, length) and presents, for each span's
+    /// per-frame values.
+    win_events: Vec<(u32, u64, u64)>,
+    win_keys: HashMap<(String, &'static str), u32>,
+    win_presents: Vec<u64>,
 }
 
 /// How long a snapshot records, and how long after that it waits for the
@@ -284,8 +301,14 @@ fn hand_over(spans: &mut Vec<(&'static str, u32, u64, u64)>) {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = state.as_mut() {
         let timeline = VIEW.load(Relaxed) == 3 || s.snap.is_some();
+        let per_frame = VIEW.load(Relaxed) == 0 && MODE.load(Relaxed) != 0;
         for (name, tid, start, ns) in spans.drain(..) {
             let g = group(tid);
+            if per_frame {
+                let next = s.win_keys.len() as u32;
+                let key = *s.win_keys.entry((g.clone(), name)).or_insert(next);
+                s.win_events.push((key, start, ns));
+            }
             if timeline {
                 s.timeline.push_back((start, ns, group_index(&g), name));
             }
@@ -329,11 +352,14 @@ pub(crate) fn frame() {
         summed: 0,
         since_ns: now,
         vram: (0, 0),
-        keys: [false; 10],
+        keys: [false; 12],
         timeline: Default::default(),
         presents: Default::default(),
         laid: None,
         snap: None,
+        win_events: Vec::new(),
+        win_keys: HashMap::new(),
+        win_presents: Vec::new(),
     });
     {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -341,7 +367,7 @@ pub(crate) fn frame() {
         // Held now (the high bit), and pressed since the last look (the low
         // bit): at 6 fps the looks are 170 ms apart, and a tap between two
         // of them was never seen (F1 "did nothing").
-        let state = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70, 0x72].map(|vk| unsafe { GetAsyncKeyState(vk) });
+        let state = [0x78, 0x26, 0x28, 0x25, 0x27, 0x79, 0x77, 0x76, 0x70, 0x72, 0x51, 0x45].map(|vk| unsafe { GetAsyncKeyState(vk) });
         let down = state.map(|k| k < 0);
         let tapped = state.map(|k| k & 1 != 0);
         let pressed = |k: usize| (down[k] && !s.keys[k]) || (tapped[k] && !down[k]);
@@ -375,6 +401,17 @@ pub(crate) fn frame() {
             if pressed(4) {
                 DEPTH.store((depth + 1).min(DEPTHS.len() as u32 - 1), Relaxed);
             }
+            // Q, E: the mode of the processor's spans and the time line.
+            if matches!(VIEW.load(Relaxed), 0 | 3) {
+                let n = MODE_NAMES.len() as u32;
+                let mode = MODE.load(Relaxed);
+                if pressed(10) {
+                    MODE.store((mode + n - 1) % n, Relaxed);
+                }
+                if pressed(11) {
+                    MODE.store((mode + 1) % n, Relaxed);
+                }
+            }
         }
         // F1: a snapshot of every view to a file (and at the moments
         // `VICTORY_SNAPSHOT_AT` names, seconds since the start).
@@ -391,6 +428,15 @@ pub(crate) fn frame() {
                 presents: Vec::new(),
             });
             RECORDING.store(true, Relaxed);
+            // The picture of the next frame, named as the snapshot will be
+            // (`write_snapshot`): the title's frame, without the overlay.
+            #[cfg(feature = "diagnostics")]
+            {
+                let dir = std::path::Path::new("snapshots");
+                let _ = std::fs::create_dir_all(dir);
+                let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                crate::capture::picture_next(dir.join(format!("{:08.1}", now as f64 / 1e9)));
+            }
             // (the machine's load, looked at every second, for the snapshot)
             crate::stats::start();
             tracing::info!("snapshot: recording {} s", SNAP_NS as f64 / 1e9);
@@ -416,13 +462,16 @@ pub(crate) fn frame() {
         if now >= snap.started + SNAP_NS + SNAP_WAIT_NS {
             let snap = s.snap.take().expect("checked");
             RECORDING.store(false, Relaxed);
-            let laid = lay_out(&s.timeline, &s.presents, now);
+            let laid = lay_out(&s.timeline, &s.presents, now, 0);
             // (the card's memory now: the overlay takes it only while it is up)
             let vram = crate::host::host()
                 .and_then(|h| h.video_memory())
                 .map_or(s.vram, |[budget, used, ..]| (used >> 20, budget >> 20));
             write_snapshot(&snap, laid.as_ref(), vram);
         }
+    }
+    if VIEW.load(Relaxed) == 0 && MODE.load(Relaxed) != 0 {
+        s.win_presents.push(now);
     }
     if (VIEW.load(Relaxed) == 3 && shown()) || s.snap.is_some() {
         s.presents.push_back(now);
@@ -449,10 +498,22 @@ pub(crate) fn frame() {
             *m = *sum as f64 / n;
             *sum = 0;
         }
+        // In the p90 or max mode: each span's value in one frame, by the
+        // frame it began in (frames end at the presents of this half second).
+        let picked = (MODE.load(Relaxed) != 0).then(|| window_picks(&s.win_events, &s.win_keys, &s.win_presents, MODE.load(Relaxed)));
+        s.win_events.clear();
+        s.win_presents.clear();
+        let keys = std::mem::take(&mut s.win_keys);
         s.rows = s
             .spans
             .drain()
-            .map(|((group, name), (ns, count))| (group, name, ns as f64 / 1e6 / n, f64::from(count) / n))
+            .map(|((group, name), (ns, count))| {
+                let ms = match picked.as_ref().and_then(|p| keys.get(&(group.clone(), name)).and_then(|&k| p.get(k as usize))) {
+                    Some(&v) => v as f64 / 1e6,
+                    None => ns as f64 / 1e6 / n,
+                };
+                (group, name, ms, f64::from(count) / n)
+            })
             .collect();
         // Thread groups in a fixed order, the heaviest spans first in each.
         let order = |g: &str| match g {
@@ -471,7 +532,7 @@ pub(crate) fn frame() {
         s.summed = 0;
         s.since_ns = now;
         if VIEW.load(Relaxed) == 3 && shown() {
-            s.laid = lay_out(&s.timeline, &s.presents, now);
+            s.laid = lay_out(&s.timeline, &s.presents, now, MODE.load(Relaxed));
         }
         #[cfg(feature = "diagnostics")]
         if shown() && VIEW.load(Relaxed) == 2 && now - s.memory_at >= 2_000_000_000 {
@@ -494,9 +555,24 @@ fn lay_out(
     timeline: &std::collections::VecDeque<(u64, u64, u8, &'static str)>,
     presents: &std::collections::VecDeque<u64>,
     now: u64,
+    mode: u32,
 ) -> Option<Laid> {
     let pairs: Vec<(u64, u64)> = presents.iter().zip(presents.iter().skip(1)).map(|(&a, &b)| (a, b)).collect();
-    let &(from, to) = pairs.iter().rev().find(|(_, end)| end + SHOW_BEHIND_NS <= now)?;
+    // Frames whose card times have arrived and whose spans are all still
+    // kept: the last one in the mean mode; else the one at the mode's place
+    // by length (the 90th percentile, or the longest).
+    let kept_from = timeline.front().map_or(u64::MAX, |t| t.0);
+    let ready: Vec<(u64, u64)> = pairs.iter().copied().filter(|&(a, b)| b + SHOW_BEHIND_NS <= now && a >= kept_from).collect();
+    let &(from, to) = match mode {
+        0 => pairs.iter().rev().find(|(_, end)| end + SHOW_BEHIND_NS <= now)?,
+        _ => {
+            let mut by_len = ready.clone();
+            by_len.sort_by_key(|&(a, b)| b - a);
+            let at = if mode == 1 { ((by_len.len() as f64 - 1.0) * 0.9).round() as usize } else { by_len.len().checked_sub(1)? };
+            let pick = *by_len.get(at)?;
+            ready.iter().find(|&&p| p == pick)?
+        }
+    };
     let mut spans: Vec<(u64, u64, u8, &'static str)> =
         timeline.iter().copied().filter(|&(start, len, ..)| start < to && start + len > from).collect();
     // Longer first among equal starts: a holder comes before what it holds.
@@ -550,7 +626,11 @@ fn colour_of(name: &str) -> u32 {
 fn draw_timeline(px: &mut [u32], s: &State, lines: &mut Vec<(String, Option<(f64, f64, f64)>)>) -> u32 {
     const HEAD: u32 = 0xff9c_d0ff;
     const TEXT: u32 = 0xfff0_f0f0;
-    text_at(px, 2, 22, "TIME LINE OF ONE FRAME, 2 S AGO (F9: TOTALS)", HEAD);
+    let heading = match MODE.load(Relaxed) {
+        0 => "TIME LINE OF ONE FRAME, 2 S AGO (F9: TOTALS; Q/E: MEAN)".to_owned(),
+        _ => format!("TIME LINE OF THE {} FRAME OF THE LAST 2 S (Q/E)", mode_name()),
+    };
+    text_at(px, 2, 22, &heading, HEAD);
     let Some(laid) = &s.laid else {
         text_at(px, 2, 34, "(THE CARD'S TIMES ARRIVE A SECOND AND A HALF LATE)", TEXT);
         return 44;
@@ -624,6 +704,27 @@ fn snapshot_due(now: u64) -> bool {
     }
 }
 
+/// For each key of `keys`: its nanoseconds in one frame of the window, the
+/// 90th percentile (`mode` 1) or the most (2) over the frames `presents`
+/// end (a span counts for the frame it began in; a frame without it counts
+/// as 0).
+fn window_picks(events: &[(u32, u64, u64)], keys: &HashMap<(String, &'static str), u32>, presents: &[u64], mode: u32) -> Vec<u64> {
+    let frames = presents.len().max(1);
+    let n = keys.len();
+    let mut sums = vec![0u64; n * frames];
+    for &(key, start, ns) in events {
+        let frame = presents.partition_point(|&p| p <= start).min(frames - 1);
+        sums[key as usize * frames + frame] += ns;
+    }
+    (0..n)
+        .map(|k| {
+            let mut v = sums[k * frames..(k + 1) * frames].to_vec();
+            v.sort_unstable();
+            if mode == 1 { v[((v.len() as f64 - 1.0) * 0.9).round() as usize] } else { v.last().copied().unwrap_or(0) }
+        })
+        .collect()
+}
+
 /// For each span of `snap` (by its place in `keys`): the least and the most
 /// nanoseconds it took in one frame of the recording. A span counts for the
 /// frame it began in (frames end at the recorded presents); a frame without
@@ -681,7 +782,7 @@ fn write_snapshot(snap: &Snap, laid: Option<&Laid>, vram: (u64, u64)) {
     let _ = writeln!(md, "\n## Card: time per frame by pipeline ({all:.1} ms in all)\n\n| pipeline | ms | count |\n|---|---:|---:|");
     let mut gpu: Vec<(&String, f64, f64)> = snap.gpu.iter().map(|(k, (us, c))| (k, *us as f64 / 1e3 / n, f64::from(*c) / n)).collect();
     gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
-    for (name, ms, count) in gpu.iter().take(60) {
+    for (name, ms, count) in gpu.iter() {
         let text = pipeline_text(name).to_lowercase();
         let _ = writeln!(md, "| {text} `{name}` | {ms:.2} | {count:.1} |");
     }
@@ -924,7 +1025,8 @@ pub(crate) fn draw() -> Vec<u32> {
             lines.push(("(THE CARD'S TIMES ARRIVE A SECOND AND A HALF LATE)".to_owned(), None));
         }
     } else {
-        text_at(&mut px, 2, 22, "SPAN PER FRAME (F10: CARD)                          MS     X", HEAD);
+        let heading = format!("SPAN PER FRAME, {:<4} (Q/E; F10: CARD)              MS     X", mode_name());
+        text_at(&mut px, 2, 22, &heading, HEAD);
         // A heading when the thread group changes, then its spans.
         let (mut group, mut in_group) = ("", 0);
         for (g, name, ms, count) in &s.rows {
