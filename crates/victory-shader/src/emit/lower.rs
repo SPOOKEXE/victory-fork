@@ -221,6 +221,10 @@ struct Lower<'a> {
     /// others out ([`Self::dispatch_threads_prologue`]).
     partial_active: Option<V>,
     bools: HashMap<(usize, Bool), V>,
+    /// Runs of one operation over lane-boolean terms ([`Self::boolean`]):
+    /// by block, lane (`upper`), `and` (else `or`) and the terms so far,
+    /// each an atom and whether it is taken as it is (else negated).
+    chains: HashMap<(usize, bool, bool, Vec<(Atom, bool)>), V>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
@@ -2044,6 +2048,7 @@ impl<'a> Lower<'a> {
             body_entry: entry,
             partial_active: None,
             bools: HashMap::new(),
+            chains: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
@@ -3529,6 +3534,8 @@ impl<'a> Lower<'a> {
             139,
             &[directory, at, iu, both, align],
         );
+        // The host fills the directory before the shader runs.
+        self.s.m.fixed(entry);
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
         // A page without a copy: its number, at a place by the number, or
@@ -3548,7 +3555,7 @@ impl<'a> Lower<'a> {
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
-        self.s.op(
+        let fault = self.s.op(
             c,
             "rawBufferStore.i32",
             Attr::NoUnwind,
@@ -3556,6 +3563,7 @@ impl<'a> Lower<'a> {
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
+        self.s.m.sink(fault);
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
@@ -4312,6 +4320,10 @@ impl<'a> Lower<'a> {
         if let Some(&v) = self.bools.get(&(at, b)) {
             return Ok(v);
         }
+        if let Some(v) = self.chain(b, at)? {
+            self.bools.insert((at, b), v);
+            return Ok(v);
+        }
         let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
         let a = self.atom(atom, at)?;
         let m = &mut self.s.m;
@@ -4337,6 +4349,105 @@ impl<'a> Lower<'a> {
         };
         self.bools.insert((at, b), v);
         Ok(v)
+    }
+
+    /// `b` when it is a run of two or more terms under one operation (each
+    /// node with a false side: `and`; with a true side: `or`), built from
+    /// the top: `((t1 & t2) & t3) & rest`. The diagram orders atoms oldest
+    /// first, so a condition that adds a newer term to an older one (the
+    /// cases of a switch, a branch inside a branch) differs from it only at
+    /// the bottom: built from the top, it is the older run's value and one
+    /// operation, where built from the bottom every term is joined anew.
+    /// `None` for other nodes.
+    fn chain(&mut self, b: Bool, at: usize) -> Result<Option<V>, Why> {
+        let x = self.x;
+        let bools = &x.st.bools;
+        let Some((_, lo, hi)) = bools.node(b) else {
+            return Ok(None);
+        };
+        let and = if lo == Bool::FALSE || hi == Bool::FALSE {
+            true
+        } else if lo == Bool::TRUE || hi == Bool::TRUE {
+            false
+        } else {
+            return Ok(None);
+        };
+        // The terms from the top, each as it is or negated, and what the
+        // run joins below them (the operation's identity when nothing).
+        let mut terms = Vec::new();
+        let mut rest = b;
+        let mut below_first = b;
+        while let Some((atom, lo, hi)) = bools.node(rest) {
+            let step = match (and, lo, hi) {
+                (true, Bool::FALSE, h) => (true, h),
+                (true, l, Bool::FALSE) => (false, l),
+                (false, l, Bool::TRUE) => (true, l),
+                (false, Bool::TRUE, h) => (false, h),
+                _ => break,
+            };
+            terms.push((atom, step.0));
+            rest = step.1;
+            if terms.len() == 1 {
+                below_first = rest;
+            }
+        }
+        if terms.len() < 2 {
+            return Ok(None);
+        }
+        let upper = self.upper;
+        let key = |k: usize| (at, upper, and, terms[..=k].to_vec());
+        // The longest run from the top already built in this block.
+        let (mut start, mut acc) = (0, None);
+        for k in (1..terms.len()).rev() {
+            if let Some(&v) = self.chains.get(&key(k)) {
+                (start, acc) = (k + 1, Some(v));
+                break;
+            }
+        }
+        // What follows the first term built already, and less of the run
+        // from the top: one operation from the bottom (conditions that share
+        // their newer terms).
+        if start + 1 < terms.len() && self.bools.contains_key(&(at, below_first)) {
+            return Ok(None);
+        }
+        // A negated first term is the condition of the second's select.
+        let mut negated_first = None;
+        for k in start..terms.len() {
+            let (atom, plain) = terms[k];
+            let a = self.atom(atom, at)?;
+            let m = &mut self.s.m;
+            let (yes, no) = (m.bool(true), m.bool(false));
+            let v = match (acc, negated_first) {
+                (Some(p), _) => match (and, plain) {
+                    (true, true) => m.bin(at, Bin::And, p, a),
+                    (true, false) => m.select(at, a, no, p),
+                    (false, true) => m.bin(at, Bin::Or, p, a),
+                    (false, false) => m.select(at, a, p, yes),
+                },
+                (None, None) if plain => a,
+                (None, None) => {
+                    negated_first = Some(a);
+                    continue;
+                }
+                (None, Some(first)) => {
+                    let x = if plain { a } else { m.bin(at, Bin::Xor, a, yes) };
+                    if and {
+                        m.select(at, first, no, x)
+                    } else {
+                        m.select(at, first, x, yes)
+                    }
+                }
+            };
+            self.chains.insert(key(k), v);
+            acc = Some(v);
+        }
+        let run = acc.expect("a run of two terms or more");
+        if rest == Bool::TRUE || rest == Bool::FALSE {
+            return Ok(Some(run));
+        }
+        let r = self.boolean(rest, at)?;
+        let op = if and { Bin::And } else { Bin::Or };
+        Ok(Some(self.s.m.bin(at, op, run, r)))
     }
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {

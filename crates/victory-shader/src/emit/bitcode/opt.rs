@@ -10,17 +10,24 @@
 //!   value whether anything reads the new one or not).
 //! - [`FOLD`]: integer arithmetic on constants is done here, and identities
 //!   (`x + 0`, `x & -1`, a select between a value and itself, a cast there
-//!   and back, a join of one value) give their operand. Float arithmetic is
-//!   left alone: `x + 0.0` and `x * 1.0` are not `x` for every `x`.
+//!   and back, a join of one value) give their operand, and an `or` of
+//!   bits a shift right or a mask drops is left out of it. Float
+//!   arithmetic is left alone: `x + 0.0` and `x * 1.0` are not `x` for
+//!   every `x`.
 //! - [`REUSE`]: an instruction without an effect whose operands are those
 //!   of an earlier one that every path to it has run gives that one's
 //!   result (a descriptor handle made again in each block, an index clamped
-//!   again, a register read as a float again).
+//!   again, a register read as a float again, a read of the memory
+//!   directory past stores); a memory fault noted again is left out.
 //! - [`FACTS`]: in the blocks only one side of a branch leads to, the
 //!   branch's condition is that side's constant, and so is what the
 //!   condition was made of (both terms of an `and` that held, the opposite
 //!   comparison). The lowering branches on a lane's condition and then
 //!   guards each instruction behind the branch with the same condition.
+//!   And a value that matters only where a condition holds reads a select
+//!   on it as its first value: what is computed under a guard from a
+//!   register written under the same guard reads the new value, not the
+//!   guard's select of new and old.
 //! - [`LOADS`]: within a block, a read of the same place as an earlier read
 //!   gives that one's result while no store, atomic, barrier or other call
 //!   with an effect stands between them (another thread's unsynchronised
@@ -246,6 +253,9 @@ impl Module {
                 if passes & FOLD != 0 {
                     changed |= self.prune();
                 }
+                if passes & FACTS != 0 {
+                    changed |= self.masked();
+                }
                 if !changed {
                     break;
                 }
@@ -457,6 +467,37 @@ impl Module {
                     };
                     return Some(self.k(ty, bits, r));
                 }
+                // Bits an `or` sets that a shift right or a mask drops:
+                // `(x | 52) >> 16` is `x >> 16` (an address and its
+                // neighbour on one memory page), `(x | 4) & 3` is `x & 3`.
+                let (ored, y) = match (ka, kb) {
+                    (None, Some(y)) => (a, Some(y)),
+                    (Some(y), None) if op == Bin::And => (b, Some(y)),
+                    _ => (a, None),
+                };
+                if let (Some(y), V::Inst(o)) = (y, ored)
+                    && let Op::Bin(Bin::Or, p, q) = self.insts[o as usize].op
+                {
+                    let (x, k) = match (self.int_k(p), self.int_k(q)) {
+                        (None, Some((_, k))) => (p, k),
+                        (Some((_, k)), None) => (q, k),
+                        _ => (ored, 0),
+                    };
+                    let dropped = match op {
+                        Bin::LShr | Bin::AShr if y < u64::from(bits) => k >> y == 0,
+                        Bin::And => k & y == 0,
+                        _ => false,
+                    };
+                    if x != ored && dropped {
+                        self.insts[i as usize].op = if ored == a {
+                            Op::Bin(op, x, b)
+                        } else {
+                            Op::Bin(op, a, x)
+                        };
+                        *changed = true;
+                        return None;
+                    }
+                }
                 match (op, ka, kb) {
                     (
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
@@ -651,6 +692,7 @@ impl Module {
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => Effect::Writes,
             Op::Phi(_) => Effect::Lanes,
+            Op::Call(..) if self.fixed.contains(&i) || self.sinks.contains(&i) => Effect::Pure,
             Op::Call(f, _) => effects[*f as usize],
         }
     }
@@ -927,6 +969,160 @@ impl Module {
             }
         }
         true
+    }
+
+    /// Whether `ty` is a number (or a bit).
+    fn number(&self, ty: Ty) -> bool {
+        matches!(
+            self.types[ty.0 as usize],
+            TypeDef::Int(_) | TypeDef::Float | TypeDef::Double
+        )
+    }
+
+    /// Whether instruction `i`'s result in a lane is a function of that
+    /// lane's operands alone, with no effect and nothing undefined whatever
+    /// they are: arithmetic other than integer division, compares, casts,
+    /// selects of numbers, and pure calls on numbers other than derivatives
+    /// (which read the quad's other lanes). Handles are left out (a
+    /// descriptor index must stay uniform where the code says so), and so
+    /// are reads of memory (a place in a lane that does not run may lie
+    /// past a root view's end).
+    fn lane_local(&self, effects: &[Effect], i: u32) -> bool {
+        let inst = &self.insts[i as usize];
+        match &inst.op {
+            Op::Bin(Bin::UDiv | Bin::SDiv | Bin::URem, ..) => self.int_bits(inst.ty).is_none(),
+            Op::Select(..) => self.number(inst.ty),
+            Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Extract(..) => true,
+            Op::Call(f, args) => {
+                effects[*f as usize] == Effect::Pure
+                    && self.number(inst.ty)
+                    && args.iter().all(|&a| self.number(self.type_of(a)))
+                    && !args
+                        .first()
+                        .and_then(|&a| self.int_value(a))
+                        .is_some_and(|k| (83..=86).contains(&k))
+            }
+            _ => false,
+        }
+    }
+
+    /// Adds `c` to the sorted conditions `set`, and what it says of the
+    /// values it was made of (both terms of an `and`).
+    fn conjuncts(&self, c: V, set: &mut Vec<V>, depth: u32) {
+        if let Err(at) = set.binary_search(&c) {
+            set.insert(at, c);
+        }
+        let V::Inst(i) = c else { return };
+        if depth == 0 || self.int_bits(self.insts[i as usize].ty) != Some(1) {
+            return;
+        }
+        match self.insts[i as usize].op {
+            Op::Bin(Bin::And, a, b) => {
+                self.conjuncts(a, set, depth - 1);
+                self.conjuncts(b, set, depth - 1);
+            }
+            Op::Select(a, b, f) if self.int_k(f).is_some_and(|k| k.1 == 0) => {
+                self.conjuncts(a, set, depth - 1);
+                self.conjuncts(b, set, depth - 1);
+            }
+            Op::Select(_, t, b) if self.int_k(t).is_some_and(|k| k.1 == 0) => {
+                self.conjuncts(b, set, depth - 1);
+            }
+            _ => {}
+        }
+    }
+
+    /// `v`, or what a select on one of the conditions in `set` gives where
+    /// they hold.
+    fn unmask(&self, mut v: V, set: &[V]) -> V {
+        while let V::Inst(i) = v
+            && let Op::Select(c, t, _) = self.insts[i as usize].op
+            && set.binary_search(&c).is_ok()
+        {
+            v = t;
+        }
+        v
+    }
+
+    /// [`FACTS`]: a value that matters only in the lanes where some
+    /// conditions hold reads, of a select on one of them, the value it
+    /// gives there. A guarded write keeps a register's old value in the
+    /// lanes its guard leaves out (`select(g, new, old)`); what the
+    /// instructions under the same guard compute from the register is
+    /// itself kept only where `g` holds, so they read `new`, and the select
+    /// is left to the reads outside the guard (or to [`DEAD`]). Only
+    /// [`Module::lane_local`] instructions pass the conditions on to their
+    /// operands; a value anything else reads matters in every lane.
+    /// Returns whether an operand changed.
+    fn masked(&mut self) -> bool {
+        if self.blocks.is_empty() {
+            return false;
+        }
+        const MOST: usize = 32;
+        let effects = self.effects();
+        let tree = self.dominator_tree();
+        // Per instruction: the conditions that hold in every lane where its
+        // value matters, sorted (none: nothing reached reads it yet).
+        let mut under: Vec<Option<Vec<V>>> = vec![None; self.insts.len()];
+        let meet = |under: &mut [Option<Vec<V>>], v: V, set: &[V]| {
+            if let V::Inst(d) = v {
+                let u = &mut under[d as usize];
+                match u {
+                    None => *u = Some(set.to_vec()),
+                    Some(old) => old.retain(|x| set.binary_search(x).is_ok()),
+                }
+            }
+        };
+        for &b in &tree.order {
+            for &p in &self.blocks[b].phis {
+                for_each_operand(&self.insts[p as usize].op, |v| meet(&mut under, v, &[]));
+            }
+            if let Some(Term::CondBr(c, ..)) = self.blocks[b].term {
+                meet(&mut under, c, &[]);
+            }
+        }
+        let mut changed = false;
+        // Every read but a join's comes after the value in this order.
+        for &b in tree.order.iter().rev() {
+            for k in (0..self.blocks[b].body.len()).rev() {
+                let i = self.blocks[b].body[k];
+                if !self.lane_local(&effects, i) {
+                    for_each_operand(&self.insts[i as usize].op, |v| meet(&mut under, v, &[]));
+                    continue;
+                }
+                let Some(set) = under[i as usize].take() else {
+                    continue;
+                };
+                let mut op = self.insts[i as usize].op.clone();
+                let mut moved = false;
+                if let Op::Select(c, t, f) = &mut op {
+                    // The first value matters only where the condition holds too.
+                    let mut first = set.clone();
+                    if first.len() < MOST {
+                        self.conjuncts(*c, &mut first, 4);
+                    }
+                    let new = (self.unmask(*c, &set), self.unmask(*t, &first), self.unmask(*f, &set));
+                    moved = new != (*c, *t, *f);
+                    (*c, *t, *f) = new;
+                    meet(&mut under, *c, &set);
+                    meet(&mut under, *t, &first);
+                    meet(&mut under, *f, &set);
+                } else {
+                    map_operands(&mut op, |v| {
+                        let u = self.unmask(v, &set);
+                        moved |= u != v;
+                        u
+                    });
+                    for_each_operand(&op, |v| meet(&mut under, v, &set));
+                }
+                if moved {
+                    self.insts[i as usize].op = op;
+                    changed = true;
+                }
+                under[i as usize] = Some(set);
+            }
+        }
+        changed
     }
 
     /// Whether instruction `i` must stay whatever reads it.
@@ -2263,5 +2459,148 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    /// What instruction `v` is.
+    fn op(m: &Module, v: V) -> Op {
+        let V::Inst(i) = v else { panic!("{v:?} is not an instruction") };
+        m.insts[i as usize].op.clone()
+    }
+
+    /// A guarded write's select is read through by the instructions under
+    /// its guard that compute lane by lane, and stays for everything else:
+    /// a wave operation, a store, an integer division, a read of a view not
+    /// from the heap.
+    #[test]
+    fn under_its_guard_a_register_is_read_without_its_select() {
+        let Kit {
+            mut m,
+            b,
+            pure,
+            reads,
+            writes,
+        } = kit();
+        let i32t = m.int(32);
+        let wty = m.func_ty(i32t, vec![i32t, i32t]);
+        let wave = m.function("dx.op.waveReadLaneFirst.i32", wty, None, false);
+        let (one, two) = (m.i32(1), m.i32(2));
+        let x = m.call(b, reads, vec![one, one]);
+        let old = m.call(b, reads, vec![two, two]);
+        let g = m.cmp(b, pred::IULT, x, old);
+        let new = m.bin(b, Bin::Add, x, one);
+        let reg = m.select(b, g, new, old);
+        // Under g (and under a narrower guard): read through.
+        let sum = m.bin(b, Bin::Mul, reg, two);
+        let min = m.call(b, pure, vec![sum, reg]);
+        let h = m.cmp(b, pred::EQ, x, two);
+        let both = m.bin(b, Bin::And, g, h);
+        let narrow = m.bin(b, Bin::Xor, reg, x);
+        let written = m.select(b, g, min, old);
+        let written2 = m.select(b, both, narrow, old);
+        m.call(b, writes, vec![written, written2]);
+        // Not lane by lane, or not under g: the select stays.
+        let lanes = m.call(b, wave, vec![reg, one]);
+        let quotient = m.bin(b, Bin::UDiv, x, reg);
+        let q = m.select(b, g, quotient, old);
+        let loaded = m.call(b, reads, vec![reg, one]);
+        let l = m.select(b, g, loaded, old);
+        let outside = m.bin(b, Bin::Sub, reg, one);
+        m.call(b, writes, vec![lanes, q]);
+        m.call(b, writes, vec![l, outside]);
+        m.terminate(b, Term::Ret);
+        m.optimise(FACTS);
+        assert!(matches!(op(&m, sum), Op::Bin(Bin::Mul, a, _) if a == new));
+        assert!(matches!(op(&m, min), Op::Call(_, args) if args[1] == new));
+        assert!(matches!(op(&m, narrow), Op::Bin(Bin::Xor, a, _) if a == new), "g holds where both do");
+        assert!(matches!(op(&m, lanes), Op::Call(_, args) if args[0] == reg));
+        assert!(matches!(op(&m, quotient), Op::Bin(Bin::UDiv, _, d) if d == reg));
+        assert!(matches!(op(&m, loaded), Op::Call(_, args) if args[0] == reg));
+        assert!(matches!(op(&m, outside), Op::Bin(Bin::Sub, a, _) if a == reg));
+        m.write();
+    }
+
+    /// The bits an `or` sets below a shift right, or outside an `and`'s
+    /// mask, are left out of it (an address and its neighbour on one
+    /// memory page give one page); bits it keeps are not.
+    #[test]
+    fn bits_an_or_sets_that_a_shift_or_mask_drops_are_left_out() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let one = m.i32(1);
+        let x = m.call(b, reads, vec![one, one]);
+        let k = |m: &mut Module, v: u32| m.i32(v);
+        let (k52, k16, k4, k3, k64k) = (k(&mut m, 52), k(&mut m, 16), k(&mut m, 4), k(&mut m, 3), k(&mut m, 0x1_0000));
+        let near = m.bin(b, Bin::Or, x, k52);
+        let page = m.bin(b, Bin::LShr, near, k16);
+        let signed = m.bin(b, Bin::AShr, near, k16);
+        let low = m.bin(b, Bin::Or, k4, x);
+        let masked = m.bin(b, Bin::And, k3, low);
+        let far = m.bin(b, Bin::Or, x, k64k);
+        let next = m.bin(b, Bin::LShr, far, k16);
+        let kept = m.bin(b, Bin::And, low, k4);
+        m.call(b, writes, vec![page, signed]);
+        m.call(b, writes, vec![masked, next]);
+        m.call(b, writes, vec![kept, kept]);
+        m.terminate(b, Term::Ret);
+        let plain = run(&m, &[0xFFFF_FFC8, 7, 1, 0x0001_FFF0, 0x8000_0034, 0, 3]);
+        m.optimise(FOLD);
+        assert!(matches!(op(&m, page), Op::Bin(Bin::LShr, a, _) if a == x));
+        assert!(matches!(op(&m, signed), Op::Bin(Bin::AShr, a, _) if a == x));
+        assert!(matches!(op(&m, masked), Op::Bin(Bin::And, k, a) if k == k3 && a == x));
+        assert!(matches!(op(&m, next), Op::Bin(Bin::LShr, a, _) if a == far), "bit 16 is kept");
+        assert!(matches!(op(&m, kept), Op::Bin(Bin::And, a, _) if a == low), "bit 2 is kept");
+        assert_eq!(run(&m, &[0xFFFF_FFC8, 7, 1, 0x0001_FFF0, 0x8000_0034, 0, 3]), plain);
+        m.write();
+    }
+
+    /// A read of memory nothing writes while the shader runs is one value
+    /// across stores and blocks; a store nothing reads that repeats an
+    /// earlier one is left out. Other reads and stores are left alone.
+    #[test]
+    fn fixed_reads_and_repeated_sinks() {
+        let Diamond {
+            k:
+                Kit {
+                    mut m,
+                    b,
+                    reads,
+                    writes,
+                    ..
+                },
+            then,
+            ..
+        } = diamond();
+        let (one, two) = (m.i32(1), m.i32(2));
+        let first = m.call(b, reads, vec![two, one]);
+        m.fixed(first);
+        let fault = m.call(b, writes, vec![first, one]);
+        m.sink(fault);
+        let store = m.call(b, writes, vec![first, two]);
+        let again = m.call(b, reads, vec![two, one]);
+        m.fixed(again);
+        let plain = m.call(b, reads, vec![one, two]);
+        let fault2 = m.call(b, writes, vec![first, one]);
+        m.sink(fault2);
+        let store2 = m.call(b, writes, vec![first, two]);
+        m.call(b, writes, vec![again, plain]);
+        let below = m.call(then, reads, vec![two, one]);
+        m.fixed(below);
+        m.call(then, writes, vec![below, below]);
+        let plain2 = m.call(then, reads, vec![one, two]);
+        m.call(then, writes, vec![plain2, plain2]);
+        let _ = (store, store2);
+        m.optimise(REUSE | LOADS | DEAD);
+        assert_eq!(
+            stores(&m, b),
+            [vec![first, one], vec![first, two], vec![first, two], vec![first, plain]],
+            "one fault; both plain stores; the second fixed read is the first"
+        );
+        assert_eq!(stores(&m, then), [vec![first, first], vec![plain2, plain2]]);
+        m.write();
     }
 }

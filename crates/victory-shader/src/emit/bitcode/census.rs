@@ -57,9 +57,13 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
+/// Whether modules are counted (`VICTORY_SHADER_CENSUS` set; always in
+/// tests).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return true;
+    }
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
 }
 
