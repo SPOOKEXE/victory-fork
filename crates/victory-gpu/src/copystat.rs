@@ -966,6 +966,8 @@ pub(crate) fn memory_rows() -> Vec<(&'static str, String, u64, u64)> {
     let views = crate::descriptor::views_kept();
     let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
     let kept = crate::pipeline::kept();
+    let holes = crate::resource::holes::bytes();
+    let rest = card[1].saturating_sub(crate::resource::holes::placed() + holes);
     let mut rows = vec![
         ("card memory", "in use (of the budget below)".to_owned(), card[1], 0),
         ("card memory", "budget the system gives us".to_owned(), card[0], 0),
@@ -973,6 +975,10 @@ pub(crate) fn memory_rows() -> Vec<(&'static str, String, u64, u64)> {
         ("card memory", " textures the title fills".to_owned(), census[5], census[4]),
         ("card memory", " targets the host renders to".to_owned(), census[1], census[0]),
         ("card memory", " made again after being let go".to_owned(), kinds[5], kinds[4]),
+        ("card memory", "card copies of title buffers and windows".to_owned(), crate::shadow::card_bytes(), 0),
+        ("card memory", "the tile pool's heaps".to_owned(), crate::tiles::pool_bytes(), 0),
+        ("card memory", "holes in vkd3d's chunks (estimate)".to_owned(), holes, 0),
+        ("card memory", "the rest (heaps, vkd3d's own)".to_owned(), rest, 0),
         ("card memory", "PC memory shared with the card".to_owned(), card[3], 0),
         ("title memory", "title textures with no host copy".to_owned(), census[3], census[2]),
         ("PC memory", "process private".to_owned(), private, 0),

@@ -234,6 +234,12 @@ pub(crate) fn placed_line() {
     );
 }
 
+/// Bytes on the card of title buffers' copies, their "before" twins and
+/// windows' card sides.
+pub(crate) fn card_bytes() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed) + CARD_BYTES[1].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 

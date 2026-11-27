@@ -1485,8 +1485,8 @@ pub(crate) fn host_made<'a>(
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
+/// by this process, less [`holes`], is under 96 % of the budget the system
+/// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
@@ -1513,10 +1513,86 @@ pub(crate) fn room() -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
+        // Less the holes in vkd3d-proton's chunks ([`holes`]), which new
+        // copies fill first, but only while the card's memory in use as
+        // the system counts it is under 97 % of the budget itself (filling
+        // a hole leaves that number where it is), so the card is never
+        // fuller than without the holes: the budget leaves the driver
+        // little of its own, and shrinks when another program takes the
+        // card's memory (run of 2026-11-27: the driver could not reserve
+        // a context buffer at 17.8 GB of 18.1 with a second program
+        // holding 3.5 GB, and ran short at 22.2 of 22.2 with none).
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            used.saturating_sub(holes::bytes()) + crate::shadow::card_room_kept() + targets_room_kept()
+                < budget / 100 * room_percent()
+                && used < budget / 100 * 97
         }
         None => filled < WITHOUT_BUDGET,
+    }
+}
+
+/// The card's memory freed inside vkd3d-proton's chunks, which the
+/// system's count of memory in use cannot show.
+///
+/// vkd3d-proton places committed textures under 8 MiB in chunks of 16 or
+/// 32 MiB, and gives a chunk back only when nothing is left in it; a new
+/// texture takes free room in a chunk before a new one is made. A copy the
+/// sweep lets go, or a title texture released, frees its room in the chunk
+/// but not the chunk: the copies let go are the least lately used, spread
+/// over most chunks. Run of 2026-11-27: from 91 s to 241 s the host
+/// textures fell from 17.0 to 13.3 GB with the card in use at its budget
+/// throughout, while 20,809 title textures waited for a copy.
+///
+/// So: the card's memory in use that the host's own counts do not place
+/// (host textures, twins included; card copies of title buffers and
+/// windows; the tile pool's heaps) is sampled twice a second while the
+/// card is four fifths full or more; its least (of the larger of two
+/// samples in a row, so one count read while an allocation is half made
+/// does not set it) is what is in use besides, and whatever more is
+/// unplaced now is taken for holes. Holes that are not would let the
+/// queue fill past its line, which is why [`room`] still stops short of
+/// the budget itself.
+#[cfg(windows)]
+pub(crate) mod holes {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// The least unplaced bytes seen (`u64::MAX` until a sample), the
+    /// previous sample, the holes now, and the half second of the last
+    /// sample.
+    static STATE: [AtomicU64; 4] = [
+        AtomicU64::new(u64::MAX),
+        AtomicU64::new(u64::MAX),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// The bytes the host's own counts place on the card.
+    pub(crate) fn placed() -> u64 {
+        super::HOST_TEXTURES[1].load(Relaxed) + crate::shadow::card_bytes() + crate::tiles::pool_bytes()
+    }
+
+    /// Takes a sample from `memory` (`Host::video_memory`), at most twice
+    /// a second.
+    pub(crate) fn sample(memory: [u64; 4]) {
+        let [budget, used, ..] = memory;
+        let half = crate::host::now_ms() / 500 + 1;
+        if STATE[3].swap(half, Relaxed) == half {
+            return;
+        }
+        let unplaced = used.saturating_sub(placed());
+        if budget > 0 && used >= budget / 5 * 4 {
+            let previous = STATE[1].swap(unplaced, Relaxed);
+            if previous != u64::MAX {
+                STATE[0].fetch_min(previous.max(unplaced), Relaxed);
+            }
+        }
+        let least = STATE[0].load(Relaxed);
+        STATE[2].store(if least == u64::MAX { 0 } else { unplaced.saturating_sub(least) }, Relaxed);
+    }
+
+    /// The holes as of the last sample.
+    pub(crate) fn bytes() -> u64 {
+        STATE[2].load(Relaxed)
     }
 }
 
@@ -1835,11 +1911,18 @@ pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    if let Some(memory) = memory {
+        holes::sample(memory);
+    }
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
     grace::expire();
-    let Some(idle_ms) = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory())) else {
+    // By the card's memory in use as the system counts it, holes and all:
+    // what the sweep lets go also frees whole chunks now and then, which
+    // the queue needs to stay under its last line in [`room`].
+    let Some(idle_ms) = crate::host::vram_idle_ms(memory) else {
         return;
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
