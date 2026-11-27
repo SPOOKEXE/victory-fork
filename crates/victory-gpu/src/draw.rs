@@ -1945,6 +1945,7 @@ impl State {
             Some(s)
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
+            let _span = crate::trace::span("root view: a UAV copy's refresh and writes");
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
@@ -2056,6 +2057,7 @@ impl State {
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
+                let _span = crate::trace::span("root view: a new slot");
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     #[cfg(feature = "diagnostics")]
@@ -2096,6 +2098,7 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
+            let _span = crate::trace::span("root view: the copy's refresh");
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
@@ -3810,7 +3813,12 @@ impl State {
         };
         #[cfg(feature = "diagnostics")]
         tally(19, 1);
-        if let Some(view) = host.mirror(index, handle, true) {
+        let view = {
+            let _span = crate::trace::span("tables: make the slot");
+            host.mirror(index, handle, true)
+        };
+        if let Some(view) = view {
+            let _span = crate::trace::span("tables: make what it views readable");
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -3914,6 +3922,7 @@ impl State {
             }
         }
         let mut made = Vec::new();
+        let _fresh_span = (!fresh.is_empty()).then(|| crate::trace::span("tables: made afresh"));
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -3984,6 +3993,7 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
+            let key_span = crate::trace::span("fresh: the table's key");
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -3997,9 +4007,11 @@ impl State {
                 }
                 (table, n, h.finish())
             };
+            drop(key_span);
             #[cfg(feature = "diagnostics")]
             tally(0, 1);
             if let Some(&first) = self.fresh_tables.get(&key) {
+                let _span = crate::trace::span("fresh: made earlier in the list");
                 #[cfg(feature = "diagnostics")]
                 tally(1, 1);
                 // Found in the table an earlier stage of this draw made
@@ -4043,7 +4055,11 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             let mut clock = table_asked(&mut self.recording, table, n);
-            let Some(first) = host.dynamic(n) else {
+            let dynamic_span = crate::trace::span("fresh: dynamic slots");
+            let first = host.dynamic(n);
+            drop(dynamic_span);
+            let _made_span = crate::trace::span("fresh: each slot made");
+            let Some(first) = first else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -5003,7 +5019,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    let buffer = {
+        let _span = crate::trace::span("readable: find the buffer's copy");
+        crate::descriptor::host::buffer_copy(view)
+    };
+    if let Some((shadow, address, len)) = buffer {
+        let _span = crate::trace::span("readable: the buffer range's refresh");
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
@@ -5024,12 +5045,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
+            let _span = crate::trace::span("readable: a texture");
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
+                let _span = crate::trace::span("readable: texture upload");
                 crate::texture::upload(list, *resource as This, t);
             }
             // A depth texture shaders also write: what they wrote, first.

@@ -9010,7 +9010,8 @@ impl HostList {
     }
 
     /// A title buffer copy of `len` bytes from `src` to `dst` (title
-    /// addresses) whose source lies where shaders write ([`shaders_wrote`]),
+    /// addresses) whose source or destination lies where shaders write
+    /// ([`shaders_wrote`]),
     /// recorded as a copy on the card here, in the list, in order: no wait
     /// for flights at submission, as [`HostList::card_fill`] does for
     /// constant buffers. True if recorded; false leaves it to the CPU's
@@ -9040,11 +9041,21 @@ impl HostList {
         let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len as u64), crate::shadow::find(dst as u64, len as u64)) else {
             return refused(1);
         };
-        // Where shaders have changed the source this run, or a flight in
-        // the air may be writing it now (what makes the CPU's copy wait;
-        // a source first written by a flight is not learned before it
-        // lands).
-        if !shaders_wrote(src, len) && !from.writes_pending_over(src, len) {
+        // Where shaders have changed the source or the destination this
+        // run (by 64 KiB piece, or anywhere in either copy: the piece of a
+        // new offset is not learned before its first landing), or a flight
+        // in the air may be writing either now (what makes
+        // the CPU's copy wait: a copy into such a range waits as one out of
+        // it does; a range first written by a flight is not learned before
+        // it lands). On the card the copy runs after those writes, in the
+        // queue's order.
+        if !shaders_wrote(src, len)
+            && !from.writes_pending_over(src, len)
+            && !shaders_wrote(dst, len)
+            && !to.writes_pending_over(dst, len)
+            && !from.shaders_write()
+            && !to.shaders_write()
+        {
             return refused(0);
         }
         // Both whole inside their copies, not one copy. (The destination's

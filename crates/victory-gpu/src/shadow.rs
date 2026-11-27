@@ -63,6 +63,10 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// Whether a submission's shaders have been declared to write some of
+    /// this copy this run ([`Shadow::writing`]): title copies out of it or
+    /// into it go on the card ([`Shadow::shaders_write`]).
+    shader_written: std::sync::atomic::AtomicBool,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -2930,6 +2934,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            shader_written: std::sync::atomic::AtomicBool::new(false),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -2986,6 +2991,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.shader_written.store(true, Ordering::Relaxed);
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -3481,6 +3487,17 @@ impl Shadow {
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    /// Whether shaders have been declared to write some of this copy this
+    /// run, anywhere in it ([`Shadow::writing`]). A title copy at an offset
+    /// shaders have not written yet is then done on the card all the same
+    /// (`HostList::card_copy`): the world moves 20 KiB a frame out of its
+    /// 174 MB buffer at another offset each frame, so the 64 KiB pieces
+    /// learned written never held the next one, and each copy left to the
+    /// CPU waited for every flight in the air (30 to 96 ms a frame).
+    pub(crate) fn shaders_write(&self) -> bool {
+        self.shader_written.load(Ordering::Relaxed)
     }
 
     /// Whether shaders of a submission not yet copied back may be writing
