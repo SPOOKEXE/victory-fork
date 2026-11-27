@@ -84,11 +84,26 @@ fn thread() -> u32 {
     ID.with(|id| *id)
 }
 
+/// Events waiting for the writer at most; past it new ones are dropped
+/// ([`DROPPED`]). The writer formats and packs what is waiting once a
+/// second: with more than it can pack in a second the next batch was
+/// bigger, the one after bigger still (a run with spans per table entry
+/// held 23 GB of them).
+const WAITING_MOST: usize = 1_000_000;
+
+/// Events dropped because [`WAITING_MOST`] were waiting, since the start.
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn push(event: Event) {
     if FULL.load(Relaxed) || !file() {
         return;
     }
-    EVENTS.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+    let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if events.len() >= WAITING_MOST {
+        DROPPED.fetch_add(1, Relaxed);
+        return;
+    }
+    events.push(event);
 }
 
 /// A span being timed; recorded when dropped.
@@ -217,6 +232,11 @@ fn flush() {
     let first = WRITTEN.load(Relaxed) == 0;
     if events.is_empty() && !first {
         return;
+    }
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dropped = DROPPED.load(Relaxed);
+    if dropped > SAID.swap(dropped, Relaxed) {
+        tracing::warn!(dropped, "frame graph: events dropped since the start, more were waiting than the writer keeps up with");
     }
     let text = json(&events, first, &mut named);
     let packed = gzip(text.as_bytes());

@@ -576,12 +576,28 @@ mod sites {
 /// additions per allocation and per release: diagnostics builds only).
 struct Counting;
 
+/// A block of 1 GiB or more: its stack said, the first 8 times (a block that
+/// size is a buffer grown past any use of ours).
+fn huge(size: usize) {
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if size < 1 << 30 || SAID.load(Relaxed) >= 8 || BUSY.swap(true, Relaxed) {
+        return;
+    }
+    SAID.fetch_add(1, Relaxed);
+    let trace = std::backtrace::Backtrace::force_capture();
+    eprintln!("VIctory: a block of {} MB made here:\n{trace}", size >> 20);
+    BUSY.store(false, Relaxed);
+}
+
 // SAFETY: every call goes to the system's allocator unchanged; only
 // counters are kept beside it.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
         let at = unsafe { std::alloc::System.alloc(layout) };
+        huge(layout.size());
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -593,6 +609,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
         let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        huge(layout.size());
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -612,6 +629,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
         let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        huge(size);
         if !moved.is_null() {
             sites::released(at);
             sites::made(moved, size);

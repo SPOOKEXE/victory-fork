@@ -3813,12 +3813,7 @@ impl State {
         };
         #[cfg(feature = "diagnostics")]
         tally(19, 1);
-        let view = {
-            let _span = crate::trace::span("tables: make the slot");
-            host.mirror(index, handle, true)
-        };
-        if let Some(view) = view {
-            let _span = crate::trace::span("tables: make what it views readable");
+        if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -5019,12 +5014,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    let buffer = {
-        let _span = crate::trace::span("readable: find the buffer's copy");
-        crate::descriptor::host::buffer_copy(view)
-    };
-    if let Some((shadow, address, len)) = buffer {
-        let _span = crate::trace::span("readable: the buffer range's refresh");
+    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
@@ -5045,14 +5035,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let _span = crate::trace::span("readable: a texture");
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                let _span = crate::trace::span("readable: texture upload");
                 crate::texture::upload(list, *resource as This, t);
             }
             // A depth texture shaders also write: what they wrote, first.
