@@ -189,17 +189,6 @@ default VICTORY_FILL_WAIT learn
 # title memory, where the CPU floats boats on them (without it the first boat
 # sinks, its engine is destroyed and the hull cuts a pit in the water).
 default VICTORY_TEXTURE_BACK 1
-# Writes into title memory open the guarded blocks under them, and nothing
-# more (upstream's default since 2026-11-26 also makes the textures picked
-# by index under them due again: with it two of three 20-minute runs here
-# lost the card within five minutes, with this neither of two).
-default VICTORY_PAGE_WRITES guards
-# No texture sweep: every run here whose sweep let copies go lost the card
-# within seconds to minutes of a pass (Xid 13), whether the pass took 28,000
-# copies or 128 and whether the copies were freed or kept; with no sweep two
-# runs of 15 and 16 minutes did not. The card fills instead, and textures
-# first asked for after that wait for room (asked again each second).
-default VICTORY_TEXTURE_SWEEP 0
 
 stamp=$(date +%Y%m%d-%H%M%S)
 since=$(date '+%Y-%m-%d %H:%M:%S')
