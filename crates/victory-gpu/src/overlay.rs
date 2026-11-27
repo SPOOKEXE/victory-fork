@@ -235,15 +235,18 @@ pub(crate) fn gpu_shown() -> bool {
 }
 
 /// The card ran pipeline `name` for `us` (a pair of the card meter, read
-/// some frames after it ran).
-pub(crate) fn gpu_span(name: &str, us: u64) {
+/// some frames after it ran), recorded at `recorded` (`crate::clock::now_ns`).
+pub(crate) fn gpu_span(name: &str, us: u64, recorded: u64) {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = state.as_mut() {
         let e = s.gpu.entry(name.to_owned()).or_insert((0, 0));
         e.0 += us;
         e.1 += 1;
-        // (the card's times of the frames recorded arrive within the wait after them)
-        if let Some(snap) = s.snap.as_mut() {
+        // The card's times of the frames recorded arrive within the wait
+        // after them; only those of lists recorded inside the recording
+        // count (the meter keeps timing through the wait, and counting the
+        // wait's lists too put 1.3 calls a frame on passes that run once).
+        if let Some(snap) = s.snap.as_mut().filter(|snap| recorded >= snap.started && recorded < snap.started + SNAP_NS) {
             let e = snap.gpu.entry(name.to_owned()).or_insert((0, 0));
             e.0 += us;
             e.1 += 1;

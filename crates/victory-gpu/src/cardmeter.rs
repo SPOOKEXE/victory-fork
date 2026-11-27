@@ -469,7 +469,7 @@ pub(crate) fn collect() {
             Kind::Pipeline => {
                 if let Some(name) = m.names.remove(&pair) {
                     #[cfg(windows)]
-                    crate::overlay::gpu_span(&name, us);
+                    crate::overlay::gpu_span(&name, us, crate::clock::now_ns().saturating_sub(now.duration_since(at).as_nanos() as u64));
                     let e = m.by_pipeline.entry(name).or_insert((0, 0));
                     e.0 += 1;
                     e.1 += us;
