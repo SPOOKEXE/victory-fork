@@ -2014,7 +2014,24 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    if start >= end {
+        return false;
+    }
+    // One block (most writes): no list of the range's blocks.
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    if first + 1 == last {
+        if !g.protected.remove(&first) {
+            return false;
+        }
+        OURS.clear(first);
+        CLEAN.clear(first);
+        PUBLISHED.clear(first);
+        let mut old = 0;
+        // SAFETY: a block we made read-only.
+        unsafe { crate::native::Protect((first * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        return true;
+    }
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))

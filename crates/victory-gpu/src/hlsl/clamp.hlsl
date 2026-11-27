@@ -15,6 +15,14 @@ cbuffer Record : register(b0) {
     // Bit 4, with bit 2: the table's first word is the number of records
     // (a window, `windowed`: the CPU adds records while the list is
     // recorded), the offsets follow it.
+    // Bit 5, with bit 3 (`VICTORY_SPREAD_LEAN`, one group of at most 64
+    // records): plain [x, y, z] records, 12 bytes each, from byte 0, with
+    // the records that pass 65,535 groups in x left empty; then at
+    // `(records * 12 + 7) & ~7` a predicate word, 1 when any record that
+    // runs passes 65,535 and 0 otherwise; then 8 bytes on the
+    // [row, asked x, x, y, z] records, 20 bytes each, with only those
+    // records filled. The caller runs the plain records through the plain
+    // dispatch signature and the spread ones under the predicate.
     uint has_count;
     uint count_offset;
 };
@@ -40,6 +48,13 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+// Spread-eligible compute records over 65,535 groups in x and within it,
+// the groups past 65,535 asked in all, and (lean) whether any record that
+// runs is spread.
+groupshared uint spread_over;
+groupshared uint spread_under;
+groupshared uint spread_extra;
+groupshared uint spread_any;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
@@ -64,9 +79,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     uint dst_at = id.x * stride;
     bool spread = (has_count & 8u) != 0;
+    bool lean = spread && (has_count & 32u) != 0;
     uint row = 0;
     uint asked_x = 0;
-    if (spread) {
+    if (spread && !lean) {
         dst_at = id.x * 20u;
     }
     uint cost = 0;
@@ -76,6 +92,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
+        spread_over = 0;
+        spread_under = 0;
+        spread_extra = 0;
+        spread_any = 0;
     }
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -149,11 +169,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
     if (active && kind >= 2) {
         // Diagnostics, in the budget buffer's next words (below): the
-        // largest group count a mesh or compute record asked for, and the
-        // groups asked in all.
+        // largest group count a mesh or compute record asked for, the
+        // groups asked in all, and of the spread-eligible compute records
+        // those spread (and their groups past 65,535) and the rest.
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+        if (spread) {
+            if (row != 0u) {
+                InterlockedAdd(spread_over, 1u, was);
+                InterlockedAdd(spread_extra, min(asked_x - 65535u, 1u << 24), was);
+            } else {
+                InterlockedAdd(spread_under, 1u, was);
+            }
+        }
     }
     // The group's own records: none for a group past a count buffer's
     // count (an execution may ask for thousands and count a few), which
@@ -193,15 +222,31 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
+    // (An active thread's lane is below `n`, so its `fits` slot is set.)
+    bool over = !active || fits[gi] == 0;
+    if (lean && !over && row != 0u) {
+        uint was;
+        InterlockedOr(spread_any, 1u, was);
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind >= 2 && n > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
+        if (spread) {
+            budget.InterlockedAdd(12, spread_over, was);
+            budget.InterlockedAdd(16, spread_under, was);
+            budget.InterlockedAdd(20, spread_extra, was);
+        }
+    }
+    // Lean: the whole batch is this one group (the caller sees to that), so
+    // its first thread writes the predicate alone.
+    if (lean && gi == 0) {
+        dst_args.Store2((records * 12u + 7u) & ~7u, uint2(spread_any != 0u ? 1u : 0u, 0u));
     }
     if (!active) {
         return;
     }
-    bool over = fits[gi] == 0;
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -213,8 +258,18 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
+            row = 0;
+            asked_x = 0;
         }
-        if (spread) {
+        if (lean) {
+            // Each record in both arrays, empty in the one it does not run
+            // from (an empty record dispatches nothing).
+            uint spread_at = ((records * 12u + 7u) & ~7u) + 8u + id.x * 20u;
+            bool spread_it = row != 0u;
+            dst_args.Store3(id.x * 12u, spread_it ? uint3(0u, 0u, 0u) : groups);
+            dst_args.Store2(spread_at, spread_it ? uint2(row, asked_x) : uint2(0u, 0u));
+            dst_args.Store3(spread_at + 8u, spread_it ? groups : uint3(0u, 0u, 0u));
+        } else if (spread) {
             dst_args.Store2(dst_at, uint2(row, asked_x));
             dst_args.Store3(dst_at + 8u, groups);
         } else {
