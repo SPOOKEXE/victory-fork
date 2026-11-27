@@ -680,6 +680,7 @@ dependencies = [
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
+ "vkd3d-stats",
  "windows",
  "windows-sys",
  "zlib-rs",
@@ -744,6 +745,19 @@ dependencies = [
  "windows-sys",
  "zlib-rs",
 ]
+
+[[package]]
+name = "vkd3d-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "vkd3d-stats",
+ "windows",
+]
+
+[[package]]
+name = "vkd3d-stats"
+version = "0.1.0"
 
 [[package]]
 name = "walkdir"

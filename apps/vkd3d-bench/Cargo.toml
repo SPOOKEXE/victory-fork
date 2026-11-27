@@ -1,0 +1,23 @@
+[package]
+name = "vkd3d-bench"
+description = "Drives our vkd3d-proton's memory allocator with D3D12 workloads, no title: profiles and checks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+vkd3d-stats.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_LibraryLoader",
+] }
+
+[lints]
+workspace = true

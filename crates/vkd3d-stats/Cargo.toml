@@ -1,0 +1,11 @@
+[package]
+name = "vkd3d-stats"
+description = "The counters of our vkd3d-proton's memory allocator: their indices and rows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

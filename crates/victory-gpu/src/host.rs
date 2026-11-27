@@ -1127,6 +1127,31 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Host buffers made since the start by the code that asked (its file and
+/// line, and the maker's kind), as (count, bytes): for the vkd3d view (F2)
+/// and the snapshots, what makes the device memory vkd3d-proton allocates
+/// and frees ([`makers`]).
+static MADE_BY: Mutex<Option<std::collections::HashMap<(&'static str, u32, &'static str), (u64, u64)>>> = Mutex::new(None);
+
+/// Counts a buffer of `size` bytes of the maker `kind` for its caller.
+#[track_caller]
+fn made_by(kind: &'static str, size: u64) {
+    let at = std::panic::Location::caller();
+    let mut map = MADE_BY.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.get_or_insert_with(std::collections::HashMap::new).entry((at.file(), at.line(), kind)).or_default();
+    entry.0 += 1;
+    entry.1 += size;
+}
+
+/// Host buffers made since the start, by the code that asked: (file, line,
+/// the maker's kind, count, bytes), the most bytes first.
+pub(crate) fn makers() -> Vec<(&'static str, u32, &'static str, u64, u64)> {
+    let map = MADE_BY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all: Vec<_> = map.iter().flatten().map(|(&(f, l, k), &(n, b))| (f, l, k, n, b)).collect();
+    all.sort_by_key(|m| std::cmp::Reverse(m.4));
+    all
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -10985,7 +11010,9 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
+    #[track_caller]
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        made_by("read back", size);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -11024,7 +11051,9 @@ impl Host {
         }
     }
 
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        made_by("upload", size);
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -11877,7 +11906,9 @@ impl Host {
     /// nothing of ours does) and shaders read: for host copies the CPU
     /// fills and no shader writes. `None` where the device has no such
     /// heaps or turns the buffer down (then the caller's usual buffer).
+    #[track_caller]
     pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        made_by("card upload", size);
         if !self.gpu_upload() {
             return None;
         }
@@ -11955,7 +11986,9 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        made_by("shared", size);
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -12007,7 +12040,9 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        made_by("card", size);
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
